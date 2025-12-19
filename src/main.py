@@ -129,6 +129,13 @@ IATA_COORDS: Dict[str, Tuple[float, float]] = {
     "TPS": (37.9114, 12.4880),
 }
 
+BUNDLE_PRESETS = {
+    "Basic":       {"extra": 0,  "label": "nur kleines Handgepäck"},
+    "Regular":     {"extra": 35, "label": "inkl. großem Handgepäck"},
+    "Plus":        {"extra": 50, "label": "Sitzplatz & Priority"},
+    "Family Plus": {"extra": 42, "label": "für Familien"},
+}
+
 
 def fetch_cheapest_per_day_map(origin_iata: str, dest_iata: str, y: int, m: int, curr: str = CURRENCY_DEFAULT) -> Dict[str, dict]:
     cfg = load_api_config()
@@ -237,7 +244,12 @@ class DayQuote:
 
 @dataclass
 class Candidate:
+    # total: final für UI-Ranking (alle PAX + Bundle-Schätzer)
     total: float
+
+    # base_total: (out+ret) für 1 Pax (wie von API)
+    base_total: float
+
     out_day: str
     ret_day: str
     out_price: float
@@ -250,9 +262,19 @@ class Candidate:
     origin_iata: str
     dest_iata: str
 
+    pax_adults: int = 1
+    pax_teens: int = 0
+    pax_children: int = 0
+    pax_infants: int = 0
+    bundle: str = "Basic"
+
+    bundle_extra_per_leg: float = 0.0
+    infant_fee_per_leg: float = 0.0
+
     out_temp_ly: Optional[float] = None
     ret_temp_ly: Optional[float] = None
     score: Optional[float] = None
+
 
 
 
@@ -271,6 +293,22 @@ def months_between(start: date, end: date) -> List[Tuple[int, int]]:
             y += 1
     return ym
 
+def compute_total_price(
+    out_price: float,
+    ret_price: float,
+    adt: int, teen: int, chd: int, inf: int,
+    bundle_extra_per_leg: float,
+    infant_fee_per_leg: float,
+) -> Tuple[float, float]:
+    base_total = out_price + ret_price
+    paying = max(0, adt + teen + chd)
+    legs = 2  # hin + zurück
+
+    total = base_total * paying
+    total += bundle_extra_per_leg * legs * paying
+    total += infant_fee_per_leg * legs * max(0, inf)
+    return base_total, total
+
 
 def find_roundtrips_for_route_by_dates(
     origin: str,
@@ -281,6 +319,13 @@ def find_roundtrips_for_route_by_dates(
     max_days: int,
     currency: str,
     month_cache: Dict[Tuple[str, str, int, int, str], Dict[str, DayQuote]],
+    pax_adults: int,
+    pax_teens: int,
+    pax_children: int,
+    pax_infants: int,
+    bundle: str,
+    bundle_extra_per_leg: float,
+    infant_fee_per_leg: float,
 ) -> List[Candidate]:
 
     def get_month_map(o: str, d: str, y: int, m: int, c: str) -> Dict[str, DayQuote]:
@@ -325,22 +370,36 @@ def find_roundtrips_for_route_by_dates(
                 ret_price = ret_map[ret_day].price
                 total = out_price + ret_price
 
-                cands.append(
-                    Candidate(
-                        total=total,
-                        out_day=out_day,
-                        ret_day=ret_day,
-                        out_price=out_price,
-                        ret_price=ret_price,
-                        dep_o=info.depISO,
-                        arr_o=info.arrISO,
-                        dep_r=ret_map[ret_day].depISO,
-                        arr_r=ret_map[ret_day].arrISO,
-                        route_label=f"{origin} ↔ {dest}",
-                        origin_iata=origin,
-                        dest_iata=dest,
-                    )
+                base_total, total = compute_total_price(
+                    out_price, ret_price,
+                    pax_adults, pax_teens, pax_children, pax_infants,
+                    bundle_extra_per_leg=bundle_extra_per_leg,
+                    infant_fee_per_leg=infant_fee_per_leg,
                 )
+
+                cands.append(Candidate(
+                    total=total,
+                    base_total=base_total,
+                    out_day=out_day,
+                    ret_day=ret_day,
+                    out_price=out_price,
+                    ret_price=ret_price,
+                    dep_o=info.depISO,
+                    arr_o=info.arrISO,
+                    dep_r=ret_map[ret_day].depISO,
+                    arr_r=ret_map[ret_day].arrISO,
+                    route_label=f"{origin} ↔ {dest}",
+                    origin_iata=origin,
+                    dest_iata=dest,
+                    pax_adults=pax_adults,
+                    pax_teens=pax_teens,
+                    pax_children=pax_children,
+                    pax_infants=pax_infants,
+                    bundle=bundle,
+                    bundle_extra_per_leg=bundle_extra_per_leg,
+                    infant_fee_per_leg=infant_fee_per_leg,
+                ))
+
 
     cands.sort(key=lambda x: (x.total, x.out_day))
     return cands
@@ -353,7 +412,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QHBoxLayout, QVBoxLayout,
     QLabel, QComboBox, QLineEdit, QSpinBox, QPushButton,
     QGroupBox, QTableWidget, QTableWidgetItem, QSplitter, QMessageBox,
-    QTabWidget, QScrollArea, QDateEdit, QFileDialog, QSlider, QCheckBox
+    QTabWidget, QScrollArea, QDateEdit, QFileDialog, QSlider, QCheckBox, QSizePolicy,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -484,9 +543,8 @@ class TempHeatmapChart(FigureCanvas):
 
 
 class Worker(QObject):
-    finished = Signal(dict, list, dict, dict, dict, str)
-    # per_route, combined, price_series, temp_series_line, temp_heatmap, error
-
+    finished = Signal(dict, dict, dict, list, dict, dict, dict, str)
+    # per_route_top, per_route_all, per_route_stats, combined_top, price_series, temp_series, temp_heatmap, error
 
     def __init__(self, params):
         super().__init__()
@@ -499,6 +557,16 @@ class Worker(QObject):
         max_days = p["max_days"]
         routes = p["routes"]
         top_n = p["top_n"]
+
+        per_route_stats: Dict[str, dict] = {}   # <--- am Anfang von run() anlegen
+        pax_adults = int(p.get("pax_adults", 1))
+        pax_teens = int(p.get("pax_teens", 0))
+        pax_children = int(p.get("pax_children", 0))
+        pax_infants = int(p.get("pax_infants", 0))
+        bundle = p.get("bundle", "Basic")
+        bundle_extra_per_leg = float(p.get("bundle_extra_per_leg", 0.0))
+        infant_fee_per_leg = float(p.get("infant_fee_per_leg", 0.0))
+
 
         # Temp-Filter (optional)
         use_weather_filter = p.get("use_weather_filter", False)
@@ -515,7 +583,9 @@ class Worker(QObject):
 
 
         month_cache: Dict[Tuple[str, str, int, int, str], Dict[str, DayQuote]] = {}
-        per_route: Dict[str, List[Candidate]] = {}
+        per_route_top: Dict[str, List[Candidate]] = {}
+        per_route_all: Dict[str, List[Candidate]] = {}
+
         all_cands: List[Candidate] = []
 
         price_series: Dict[str, List[Tuple[date, float]]] = {}
@@ -561,35 +631,29 @@ class Worker(QObject):
             for (o, d) in routes:
                 label = f"{o} ↔ {d}"
                 cands = find_roundtrips_for_route_by_dates(
-                    o, d, start_date, end_date, min_days, max_days, currency, month_cache
+                    o, d, start_date, end_date,
+                    min_days, max_days, currency, month_cache,
+                    pax_adults, pax_teens, pax_children, pax_infants,
+                    bundle, bundle_extra_per_leg, infant_fee_per_leg
                 )
+
 
                 # Wetter & Score + Filter
                 filtered: List[Candidate] = []
                 for c in cands:
-                    # Zeitfilter: Abflugstunden müssen in Range liegen
-                    use_time = p.get("use_time", False)
-
-                    # Zeitfilter nur wenn aktiv
                     if use_time:
                         if not time_in_range(c.dep_o, out_dep_min_h, out_dep_max_h):
                             continue
                         if not time_in_range(c.dep_r, ret_dep_min_h, ret_dep_max_h):
                             continue
 
-                    # Temperaturen IMMER versuchen zu holen
                     c.out_temp_ly = get_temp_ly_for_iata(c.dest_iata, c.out_day)
                     c.ret_temp_ly = get_temp_ly_for_iata(c.dest_iata, c.ret_day)
 
-                    # Wetterfilter nur wenn aktiv
                     if use_weather_filter:
                         temps = [t for t in (c.out_temp_ly, c.ret_temp_ly) if t is not None]
-
-                        # wenn Filter an und "require": ohne Temps raus
                         if require_weather and not temps:
                             continue
-
-                        # wenn Temps da sind: prüfen
                         if temps:
                             avg_t = sum(temps) / len(temps)
                             if not (ideal_temp - temp_tol <= avg_t <= ideal_temp + temp_tol):
@@ -598,11 +662,26 @@ class Worker(QObject):
                     c.score = c.total
                     filtered.append(c)
 
+                # Stats jetzt erst berechnen (wenn filtered fertig ist)
+                if filtered:
+                    avg_all = sum(x.total for x in filtered) / len(filtered)
+                    min_all = min(x.total for x in filtered)
+                    max_all = max(x.total for x in filtered)
+                else:
+                    avg_all = None
+                    min_all = None
+                    max_all = None
+
+                per_route_stats[label] = {
+                    "count_all": len(filtered),
+                    "avg_all": avg_all,
+                    "min_all": min_all,
+                    "max_all": max_all,
+                }
+
                 filtered.sort(key=lambda x: (x.score if x.score is not None else 1e18, x.total, x.out_day))
-
-                rows = filtered[:top_n]
-                per_route[label] = rows
-
+                per_route_all[label] = filtered
+                per_route_top[label] = filtered[:top_n]
 
                 best_price_per_day: Dict[str, float] = {}
                 best_temp_per_day: Dict[date, float] = {}
@@ -639,7 +718,7 @@ class Worker(QObject):
                 temp_heatmap[label] = best_temp_per_day
 
             combined_pool: List[Candidate] = []
-            for rows in per_route.values():
+            for rows in per_route_all.values():
                 combined_pool.extend(rows)
 
             combined_pool.sort(key=lambda x: (x.total, x.out_day))
@@ -660,13 +739,17 @@ class Worker(QObject):
         if no_prices:
             error = "Keine Flüge/Preise in diesem Zeitraum gefunden (Ryanair API hat keine Daten geliefert)."
 
-        self.finished.emit(per_route, combined, price_series, temp_series, temp_heatmap, error)
+        self.finished.emit(per_route_top, per_route_all, per_route_stats, combined, price_series, temp_series, temp_heatmap, error)
+
+
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.last_per_route = {}
+        self.last_per_route_all = {}
+        self.last_per_route_stats = {}
         self.last_combined = []
         self.last_price_series = {}
         self.last_temp_series = {}
@@ -722,6 +805,23 @@ class MainWindow(QMainWindow):
         self.results_scroll.setWidget(self.results_container)
         self.tabs.addTab(self.results_scroll, "Ergebnisse")
 
+        self.summaryWrap = QWidget()
+        self.summaryLay = QVBoxLayout(self.summaryWrap)
+        self.summaryLay.setContentsMargins(10, 10, 10, 10)
+
+        self.lblSummaryTitle = QLabel("Kein Flug ausgewählt.")
+        self.lblSummaryTitle.setStyleSheet("font-weight:700; font-size:16px;")
+
+        self.lblSummaryBody = QLabel("")
+        self.lblSummaryBody.setTextFormat(Qt.RichText)
+        self.lblSummaryBody.setWordWrap(True)
+
+        self.summaryLay.addWidget(self.lblSummaryTitle)
+        self.summaryLay.addWidget(self.lblSummaryBody)
+        self.summaryLay.addStretch(1)
+
+        self.tabs.addTab(self.summaryWrap, "Übersicht")
+
         # Tab 2: Preise
         self.priceChart = PriceChart()
         price_wrap = QWidget()
@@ -764,8 +864,51 @@ class MainWindow(QMainWindow):
         gd.addWidget(QLabel("End-Tag"),   0, 2); gd.addWidget(self.dEnd,   0, 3)
         gd.addWidget(QLabel("Min. Tage"), 1, 0); gd.addWidget(self.minDays, 1, 1)
         gd.addWidget(QLabel("Max. Tage"), 1, 2); gd.addWidget(self.maxDays, 1, 3)
+        gd.addWidget(QLabel("Top N Ergebnisse"), 2, 0); gd.addWidget(self.topN, 2, 1)
 
         left.addWidget(g_date)
+
+        
+        g_pax = QGroupBox("Passagiere & Tarif")
+        gp = QGridLayout(g_pax)
+
+        self.cbUsePax = QCheckBox("Mehrere Passagiere / Tarif berücksichtigen")
+        self.cbUsePax.setChecked(False)
+        gp.addWidget(self.cbUsePax, 0, 0, 1, 4)
+
+        self.spAdults = QSpinBox(); self.spAdults.setRange(1, 9); self.spAdults.setValue(1)
+        self.spTeens  = QSpinBox(); self.spTeens.setRange(0, 9); self.spTeens.setValue(0)
+        self.spChd    = QSpinBox(); self.spChd.setRange(0, 9); self.spChd.setValue(0)
+        self.spInf    = QSpinBox(); self.spInf.setRange(0, 9); self.spInf.setValue(0)
+
+        self.cbBundle = QComboBox()
+        for name, meta in BUNDLE_PRESETS.items():
+            self.cbBundle.addItem(f"{name} – {meta['label']}", userData=name)
+
+
+        self.spBundleExtra = QSpinBox()
+        self.spBundleExtra.setRange(0, 500)
+        self.spBundleExtra.setSuffix(" € / Person / Strecke")
+
+        self.spInfFee = QSpinBox()
+        self.spInfFee.setRange(0, 100)
+        self.spInfFee.setSuffix(" € / Baby / Strecke")
+
+        gp.addWidget(self.spBundleExtra, 4, 0, 1, 4)
+        gp.addWidget(self.spInfFee,     5, 0, 1, 4)
+
+
+        self.cbBundle.currentIndexChanged.connect(self.on_bundle_changed)
+        self.on_bundle_changed(self.cbBundle.currentIndex())
+
+
+        gp.addWidget(QLabel("Erwachsene (ab 16 Jahre)"), 1, 0); gp.addWidget(self.spAdults, 1, 1)
+        gp.addWidget(QLabel("Jugendliche (12–15 Jahre)"), 1, 2); gp.addWidget(self.spTeens,  1, 3)
+        gp.addWidget(QLabel("Kinder (2–11 Jahre)"),       2, 0); gp.addWidget(self.spChd,    2, 1)
+        gp.addWidget(QLabel("Babys (unter 2 Jahre)"),     2, 2); gp.addWidget(self.spInf,    2, 3)
+        gp.addWidget(QLabel("Tarif"),                     3, 0); gp.addWidget(self.cbBundle, 3, 1, 1, 3)
+
+        left.addWidget(g_pax)  # ✅ genau einmal
 
 
         # =========================
@@ -790,6 +933,8 @@ class MainWindow(QMainWindow):
 
         left.addWidget(g_time)
 
+        self.cbUseTime.stateChanged.connect(self.update_time_ui_state)
+        self.update_time_ui_state()
 
         # =========================
         # C) Wetter
@@ -821,6 +966,10 @@ class MainWindow(QMainWindow):
         self.cbUseWeatherFilter.stateChanged.connect(self.update_weather_ui_state)
         self.cbRequireWeather.stateChanged.connect(self.update_weather_ui_state)
         self.update_weather_ui_state()
+        self.cbUsePax.stateChanged.connect(self.update_pax_ui_state)
+        self.update_pax_ui_state()
+
+
 
         left.addWidget(self.btnSearch)
         left.addStretch(1)
@@ -878,12 +1027,34 @@ class MainWindow(QMainWindow):
         left.addWidget(g_cache)
 
 
-        splitter = QSplitter()
-        left_widget = QWidget(); left_widget.setLayout(left)
-        splitter.addWidget(left_widget)
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Linke Seite: Inhalt in ScrollArea
+        left_widget = QWidget()
+        left_widget.setLayout(left)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_widget)
+
+        # Linke Seite soll nicht „unendlich“ breit werden:
+        left_scroll.setMinimumWidth(500)     # fühl dich frei, das anzupassen
+        # left_scroll.setMaximumWidth(520)     # optional, damit rechts mehr Platz hat
+        left_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+        # Rechte Seite: Tabs sollen den Rest füllen
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        splitter.addWidget(left_scroll)
         splitter.addWidget(self.tabs)
+
+        # Stretch: rechts bekommt immer den Großteil
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+
+        # Optional: Startbreiten (nice UX)
+        splitter.setSizes([420, 860])
+
 
         central = QWidget()
         lay = QHBoxLayout(central)
@@ -909,6 +1080,12 @@ class MainWindow(QMainWindow):
             self.o1.setEnabled(True); self.d1.setEnabled(True)
             self.o2.setEnabled(False); self.d2.setEnabled(False)
 
+    def update_time_ui_state(self):
+        enabled = self.cbUseTime.isChecked()
+        for w in (self.spOutDepMin, self.spOutDepMax, self.spRetDepMin, self.spRetDepMax):
+            w.setEnabled(enabled)
+
+
     def update_weather_ui_state(self):
         use_filter = self.cbUseWeatherFilter.isChecked()
         self.cbRequireWeather.setEnabled(use_filter)
@@ -917,6 +1094,33 @@ class MainWindow(QMainWindow):
 
         if not use_filter and self.cbRequireWeather.isChecked():
             self.cbRequireWeather.setChecked(False)
+
+    def on_bundle_changed(self, _idx: int):
+        key = self.cbBundle.currentData()  # "Basic", "Flexi Plus", ...
+        preset = BUNDLE_PRESETS.get(key, {"extra": 0})["extra"]
+        self.spBundleExtra.setValue(int(preset))
+
+
+    def update_pax_ui_state(self):
+        enabled = self.cbUsePax.isChecked()
+        for w in (
+            self.spAdults, self.spTeens, self.spChd, self.spInf,
+            self.cbBundle, self.spBundleExtra, self.spInfFee
+        ):
+            w.setEnabled(enabled)
+
+        if enabled:
+            self.on_bundle_changed(self.cbBundle.currentIndex())
+        if not enabled:
+            self.spAdults.setValue(1)
+            self.spTeens.setValue(0)
+            self.spChd.setValue(0)
+            self.spInf.setValue(0)
+            self.spBundleExtra.setValue(0)
+            self.spInfFee.setValue(0)
+
+
+
 
     def clear_tables(self):
         while self.results_layout.count():
@@ -960,7 +1164,20 @@ class MainWindow(QMainWindow):
             except ValueError:
                 return False
 
-        self.view_per_route = {k: [c for c in rows if in_range(c)] for k, rows in self.last_per_route.items()}
+        tmp_all = {k: [c for c in rows if in_range(c)] for k, rows in self.last_per_route_all.items()}
+        self.view_per_route = {k: sorted(v, key=lambda x: (x.total, x.out_day))[:self.topN.value()] for k, v in tmp_all.items()}
+
+        view_stats = {}
+        for lab, lst in tmp_all.items():
+            if lst:
+                view_stats[lab] = {
+                    "count_all": len(lst),
+                    "avg_all": sum(x.total for x in lst) / len(lst),
+                    "min_all": min(x.total for x in lst),
+                    "max_all": max(x.total for x in lst),
+                }
+
+
         self.view_combined = [c for c in self.last_combined if in_range(c)]
 
         # Serien filtern
@@ -976,9 +1193,25 @@ class MainWindow(QMainWindow):
         # UI neu rendern
         self.clear_tables()
         for label, rows in self.view_per_route.items():
-            self.add_table(f"Top {self.topN.value()} – {label} (gefiltert)", rows)
+            self.add_table(f"Top {self.topN.value()} – {label} (gefiltert)", rows, view_stats.get(label))
+
+
+        all_all = []
+        for lst in tmp_all.values():
+            all_all.extend(lst)
+
+        combined_stats = None
+        if all_all:
+            combined_stats = {
+                "count_all": len(all_all),
+                "avg_all": sum(x.total for x in all_all) / len(all_all),
+                "min_all": min(x.total for x in all_all),
+                "max_all": max(x.total for x in all_all),
+            }
+
         if self.view_combined:
-            self.add_table("GESAMT-RANKING (gefiltert)", self.view_combined)
+            self.add_table("GESAMT-RANKING (gefiltert)", self.view_combined, combined_stats)
+
 
         self.last_color_map = self.priceChart.plot_routes(self.view_price_series, self.last_color_map)
         # Heatmap: filtere heatmap data auf Datum
@@ -989,12 +1222,15 @@ class MainWindow(QMainWindow):
 
 
 
-    def add_table(self, title: str, rows: List[Candidate]):
+    def add_table(self, title: str, rows: List[Candidate], stats: Optional[dict] = None):
         label = QLabel(title)
         label.setStyleSheet("font-weight:600; margin-top:8px;")
         self.results_layout.addWidget(label)
+    
 
         table = QTableWidget()
+        table._rows = rows  # <--- hacky aber praktisch
+        table.cellClicked.connect(lambda r, c, t=table: self.on_row_selected(t, r))
         table.setColumnCount(8)
         table.setHorizontalHeaderLabels([
             "Total", "Out-Date", "Ret-Date",
@@ -1020,6 +1256,98 @@ class MainWindow(QMainWindow):
         table.resizeColumnsToContents()
         self.results_layout.addWidget(table)
 
+        # --- Statistik-Label unter der Tabelle ---
+        if stats and stats.get("count_all", 0) > 0 and stats.get("avg_all") is not None:
+            avg_all = float(stats["avg_all"])
+            n_all = int(stats["count_all"])
+
+            avg_top = (sum(c.total for c in rows) / len(rows)) if rows else None
+            delta = (avg_all - avg_top) if (avg_top is not None) else None
+
+            txt = f"Ø aller gefundenen Angebote: {avg_all:.2f} € (n={n_all})"
+            if avg_top is not None:
+                txt += f" | Ø dieser Top-Liste: {avg_top:.2f} €"
+            if delta is not None:
+                txt += f" | Unterschied: {delta:.2f} € unter Ø"
+
+            lbl = QLabel(txt)
+            lbl.setStyleSheet("color:#999; margin-bottom:10px;")
+            self.results_layout.addWidget(lbl)
+
+
+    def on_row_selected(self, table: QTableWidget, row_idx: int):
+        rows = getattr(table, "_rows", None)
+        if not rows or row_idx < 0 or row_idx >= len(rows):
+            return
+        c: Candidate = rows[row_idx]
+        self.show_summary(c)
+        self.tabs.setCurrentWidget(self.summaryWrap)
+
+    def show_summary(self, c: Candidate):
+        paying = max(0, c.pax_adults + c.pax_teens + c.pax_children)
+        infants = max(0, c.pax_infants)
+        legs = 2
+
+        # Basis: Out+Ret pro zahlender Person
+        base_per_person = c.base_total
+        base_total_all = base_per_person * paying
+
+        # Bundle & Baby Gebühren
+        bundle_total = c.bundle_extra_per_leg * legs * paying
+        infant_total = c.infant_fee_per_leg * legs * infants
+
+        grand_total = base_total_all + bundle_total + infant_total
+
+        pax_lines = []
+        pax_lines.append(f"Erwachsene: {c.pax_adults}")
+        pax_lines.append(f"Jugendliche: {c.pax_teens}")
+        pax_lines.append(f"Kinder: {c.pax_children}")
+        pax_lines.append(f"Babys: {c.pax_infants}")
+
+        self.lblSummaryTitle.setText(f"{c.route_label} – {c.out_day} bis {c.ret_day}")
+
+        # Inline CSS für größere Schrift + bessere Lesbarkeit
+        html = f"""
+        <div style="font-size:14px; line-height:1.45;">
+        <div style="font-size:18px; font-weight:700; margin-bottom:10px;">
+            Gesamt: {grand_total:.2f} €
+        </div>
+
+        <div style="margin-bottom:10px;">
+            <b>Route:</b> {c.origin_iata} → {c.dest_iata} → {c.origin_iata}<br>
+            <b>Hinflug:</b> {c.out_day} | {hhmm(c.dep_o)} → {hhmm(c.arr_o)} | {c.out_price:.2f} € pro Person<br>
+            <b>Rückflug:</b> {c.ret_day} | {hhmm(c.dep_r)} → {hhmm(c.arr_r)} | {c.ret_price:.2f} € pro Person
+        </div>
+
+        <div style="margin-bottom:10px;">
+            <b>Tarif:</b> {c.bundle}<br>
+            <b>Passagiere:</b> {" | ".join(pax_lines)}<br>
+            <b>Zahlende Personen:</b> {paying} &nbsp;&nbsp; <b>Strecken:</b> {legs}
+        </div>
+
+        <div style="margin-bottom:10px;">
+            <b>Preisaufschlüsselung:</b><br>
+            1) Grundpreis pro Person (Hin+Rück): {base_per_person:.2f} €<br>
+            2) Grundpreis gesamt: {base_per_person:.2f} × {paying} = <b>{base_total_all:.2f} €</b><br>
+            3) Tarifaufschlag: {c.bundle_extra_per_leg:.2f} × {legs} × {paying} = <b>{bundle_total:.2f} €</b><br>
+            4) Babygebühr: {c.infant_fee_per_leg:.2f} × {legs} × {infants} = <b>{infant_total:.2f} €</b><br>
+            <hr style="border:none; border-top:1px solid #ddd; margin:10px 0;">
+            <b>Gesamt:</b> {base_total_all:.2f} + {bundle_total:.2f} + {infant_total:.2f}
+            = <span style="font-size:18px; font-weight:700;">{grand_total:.2f} €</span>
+        </div>
+
+        <div>
+            <b>Wetter (letztes Jahr am Ziel):</b><br>
+            Out: {fmt_temp(c.out_temp_ly)}<br>
+            Ret: {fmt_temp(c.ret_temp_ly)}
+        </div>
+        </div>
+        """
+
+        self.lblSummaryBody.setText(html)
+
+
+
     def on_search(self):
         start_qd: QDate = self.dStart.date()
         end_qd: QDate = self.dEnd.date()
@@ -1043,6 +1371,27 @@ class MainWindow(QMainWindow):
         else:
             routes = [(self.o1.text().upper(), self.d1.text().upper())]
 
+        if self.cbUsePax.isChecked():
+            pax_adults = self.spAdults.value()
+            pax_teens = self.spTeens.value()
+            pax_children = self.spChd.value()
+            pax_infants = self.spInf.value()
+
+            # bundle als KEY speichern, nicht als kompletter Label-Text
+            bundle_text = self.cbBundle.currentText()
+            bundle = self.cbBundle.currentData() or "Basic"
+
+            bundle_extra_per_leg = float(self.spBundleExtra.value())
+            infant_fee_per_leg = float(self.spInfFee.value())
+        else:
+            pax_adults = 1
+            pax_teens = 0
+            pax_children = 0
+            pax_infants = 0
+            bundle = "Basic"
+            bundle_extra_per_leg = 0.0
+            infant_fee_per_leg = 0.0
+
         params = dict(
             currency=self.currency.currentText(),
             min_days=self.minDays.value(),
@@ -1051,6 +1400,14 @@ class MainWindow(QMainWindow):
             routes=routes,
             start_date=start_date,
             end_date=end_date,
+
+            pax_adults=pax_adults,
+            pax_teens=pax_teens,
+            pax_children=pax_children,
+            pax_infants=pax_infants,
+            bundle=bundle,
+            bundle_extra_per_leg=bundle_extra_per_leg,
+            infant_fee_per_leg=infant_fee_per_leg,
 
             use_time=self.cbUseTime.isChecked(),
             out_dep_min_h=int(self.spOutDepMin.value()),
@@ -1063,6 +1420,7 @@ class MainWindow(QMainWindow):
             ideal_temp=float(self.spIdealTemp.value()),
             temp_tol=float(self.spTempTol.value()),
         )
+
 
         self.btnSearch.setEnabled(False)
         self.statusBar().showMessage("Suche läuft… bitte warten.")
@@ -1081,7 +1439,7 @@ class MainWindow(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
-    def on_worker_finished(self, per_route, combined, price_series, temp_series, temp_heatmap, error):
+    def on_worker_finished(self, per_route_top, per_route_all, per_route_stats, combined, price_series, temp_series, temp_heatmap, error):
         self.btnSearch.setEnabled(True)
         self.statusBar().showMessage("Fertig.")
         QApplication.restoreOverrideCursor()
@@ -1091,20 +1449,40 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Fehler", error or "Unbekannter Fehler")
             return
 
-        for label, rows in per_route.items():
-            self.add_table(f"Top {self.topN.value()} – {label}", rows)
+        for label, rows in per_route_top.items():
+            self.add_table(f"Top {self.topN.value()} – {label}", rows, per_route_stats.get(label))
+
+        combined_stats = None
+        all_all = []
+        for lst in per_route_all.values():
+            all_all.extend(lst)
+
+
+        combined_stats = None
+        if all_all:
+            combined_stats = {
+                "count_all": len(all_all),
+                "avg_all": sum(x.total for x in all_all) / len(all_all),
+                "min_all": min(x.total for x in all_all),
+                "max_all": max(x.total for x in all_all),
+            }
+
         if combined:
-            self.add_table("GESAMT-RANKING", combined)
+            self.add_table("GESAMT-RANKING", combined, combined_stats)
+
 
         self.priceChart.plot_routes(price_series)
         self.tempChart.plot_heatmap(temp_heatmap)
 
         # speichern für Filter/Export
-        self.last_per_route = per_route
+        self.last_per_route = per_route_top
+        self.last_per_route_all = per_route_all
+        self.last_per_route_stats = per_route_stats
         self.last_combined = combined
         self.last_price_series = price_series
         self.last_temp_series = temp_series
         self.last_temp_heatmap = temp_heatmap
+        
 
         self.btnExportCSV.setEnabled(True)
         self.btnExportPNG.setEnabled(True)
@@ -1143,7 +1521,7 @@ class MainWindow(QMainWindow):
         import csv
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["total", "out_day", "ret_day", "out_price", "ret_price", "out_dep", "out_arr", "ret_dep", "ret_arr", "out_temp_ly", "ret_temp_ly", "route"])
+            w.writerow(["Gesamt", "Hinflug-Datum", "Rückflug-Datum", "Hinflug € / Zeit", "Rückflug € / Zeit", "Temp. Hin (letztes Jahr)", "Temp. Rück (letztes Jahr)", "Route"])
             for c in rows:
                 w.writerow([
                     f"{c.total:.2f}",
