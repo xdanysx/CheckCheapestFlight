@@ -1,5 +1,8 @@
 .venv/
 .dist/
 cache/
+build/
+dist/
 data/api.txt
 data/ryanair_api.txt
+RoundtripFinder.spec 

@@ -1170,13 +1170,22 @@ class MainWindow(QMainWindow):
         view_stats = {}
         for lab, lst in tmp_all.items():
             if lst:
+                avg_all = sum(x.total for x in lst) / len(lst)
+                best = min(x.total for x in lst)
+                worst = max(x.total for x in lst)
                 view_stats[lab] = {
                     "count_all": len(lst),
-                    "avg_all": sum(x.total for x in lst) / len(lst),
-                    "min_all": min(x.total for x in lst),
-                    "max_all": max(x.total for x in lst),
+                    "avg_all": avg_all,
+                    "min_all": best,
+                    "max_all": worst,
                 }
-
+            else:
+                view_stats[lab] = {
+                    "count_all": 0,
+                    "avg_all": None,
+                    "min_all": None,
+                    "max_all": None,
+                }
 
         self.view_combined = [c for c in self.last_combined if in_range(c)]
 
@@ -1257,22 +1266,23 @@ class MainWindow(QMainWindow):
         self.results_layout.addWidget(table)
 
         # --- Statistik-Label unter der Tabelle ---
+                # --- Statistik-Label unter der Tabelle ---
         if stats and stats.get("count_all", 0) > 0 and stats.get("avg_all") is not None:
             avg_all = float(stats["avg_all"])
             n_all = int(stats["count_all"])
 
-            avg_top = (sum(c.total for c in rows) / len(rows)) if rows else None
-            delta = (avg_all - avg_top) if (avg_top is not None) else None
-
-            txt = f"Ø aller gefundenen Angebote: {avg_all:.2f} € (n={n_all})"
-            if avg_top is not None:
-                txt += f" | Ø dieser Top-Liste: {avg_top:.2f} €"
-            if delta is not None:
-                txt += f" | Unterschied: {delta:.2f} € unter Ø"
+            best = stats.get("min_all")
+            if best is not None:
+                best = float(best)
+                diff = avg_all - best
+                txt = f"Ø aller gefundenen Angebote: {avg_all:.2f} € (n={n_all}) | Bester Deal: {best:.2f} € | Unterschied: {diff:.2f} €"
+            else:
+                txt = f"Ø aller gefundenen Angebote: {avg_all:.2f} € (n={n_all})"
 
             lbl = QLabel(txt)
             lbl.setStyleSheet("color:#999; margin-bottom:10px;")
             self.results_layout.addWidget(lbl)
+
 
 
     def on_row_selected(self, table: QTableWidget, row_idx: int):
