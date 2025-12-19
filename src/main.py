@@ -794,7 +794,7 @@ class MainWindow(QMainWindow):
         # =========================
         # C) Wetter
         # =========================
-        g_weather = QGroupBox("Wetter (Temperaturen anzeigen / optional filtern)")
+        g_weather = QGroupBox("Wetter (Temperaturen von letztem Jahr anzeigen / optional filtern)")
         gw = QGridLayout(g_weather)
 
         # 1) Wetter-Filter AUS per Default

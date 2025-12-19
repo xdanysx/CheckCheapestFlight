@@ -1,1 +1,0 @@
-https://www.danyair.com/api/beispiel/v12345/xxxxxxxx/{}/{}/cheapestPerDay

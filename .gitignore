@@ -1,3 +1,5 @@
 .venv/
-
+.dist/
+cache/
+data/api.txt
 data/ryanair_api.txt
