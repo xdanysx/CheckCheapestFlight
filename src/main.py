@@ -6,6 +6,12 @@ from datetime import datetime, timedelta, date
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
+import json
+import hashlib
+import time
+
+
+
 
 # ---------- API Config via api.txt ----------
 
@@ -43,6 +49,72 @@ def load_api_config() -> dict:
     _API_CACHE = cfg
     return cfg
 
+# ---------- Cache ----------
+
+CACHE_ROOT = (BASE_DIR / "../cache").resolve()
+RYR_CACHE_DIR = CACHE_ROOT / "ryanair"
+OM_CACHE_DIR  = CACHE_ROOT / "openmeteo"
+
+for d in (CACHE_ROOT, RYR_CACHE_DIR, OM_CACHE_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24h
+
+def _cache_dir_for_prefix(prefix: str) -> Path:
+    # ryr_* => Ryanair, om_* => Open-Meteo
+    if prefix.startswith("ryr_"):
+        return RYR_CACHE_DIR
+    if prefix.startswith("om_"):
+        return OM_CACHE_DIR
+    return CACHE_ROOT
+
+def _cache_key(prefix: str, payload: dict) -> Path:
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    h = hashlib.sha256(raw).hexdigest()[:24]
+    return _cache_dir_for_prefix(prefix) / f"{prefix}_{h}.json"
+
+def cache_get(prefix: str, payload: dict, ttl_seconds: int = CACHE_TTL_SECONDS) -> Optional[dict]:
+    p = _cache_key(prefix, payload)
+    if not p.exists():
+        return None
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        ts = obj.get("_ts", 0)
+        if (time.time() - ts) > ttl_seconds:
+            return None
+        return obj.get("data")
+    except Exception:
+        return None
+
+def cache_set(prefix: str, payload: dict, data: dict) -> None:
+    p = _cache_key(prefix, payload)
+    try:
+        obj = {"_ts": time.time(), "data": data}
+        p.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def clear_cache(kind: str = "all") -> int:
+    """
+    kind: 'ryanair' | 'weather' | 'all'
+    returns number of deleted files
+    """
+    if kind == "ryanair":
+        dirs = [RYR_CACHE_DIR]
+    elif kind == "weather":
+        dirs = [OM_CACHE_DIR]
+    else:
+        dirs = [RYR_CACHE_DIR, OM_CACHE_DIR]
+
+    deleted = 0
+    for d in dirs:
+        for f in d.glob("*.json"):
+            try:
+                f.unlink()
+                deleted += 1
+            except Exception:
+                pass
+    return deleted
 
 # ---------- HTTP / Daten ----------
 
@@ -59,10 +131,6 @@ IATA_COORDS: Dict[str, Tuple[float, float]] = {
 
 
 def fetch_cheapest_per_day_map(origin_iata: str, dest_iata: str, y: int, m: int, curr: str = CURRENCY_DEFAULT) -> Dict[str, dict]:
-    """
-    Holt fuer Monat y-m die cheapestPerDay-Daten.
-    Rueckgabe: dict[YYYY-MM-DD] = { price: float, dep: str|None, arr: str|None }
-    """
     cfg = load_api_config()
     url_template = cfg["RYANAIR_API_URL_TEMPLATE"]
 
@@ -70,13 +138,19 @@ def fetch_cheapest_per_day_map(origin_iata: str, dest_iata: str, y: int, m: int,
     url = url_template.format(origin_iata, dest_iata)
     params = {"outboundMonthOfDate": month_str, "currency": curr}
 
+    cache_payload = {
+        "o": origin_iata, "d": dest_iata, "y": y, "m": m, "curr": curr,
+        "url": url, "params": params
+    }
+    cached = cache_get("ryr_month", cache_payload)
+    if isinstance(cached, dict):
+        return cached
+
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=20)
         r.raise_for_status()
         data = r.json()
-    except requests.RequestException:
-        return {}
-    except ValueError:
+    except Exception:
         return {}
 
     outbound = data.get("outbound", {}) or {}
@@ -91,7 +165,10 @@ def fetch_cheapest_per_day_map(origin_iata: str, dest_iata: str, y: int, m: int,
         arr = f.get("arrivalDate")
         if day and isinstance(p, (int, float)):
             result[day] = {"price": float(p), "dep": dep, "arr": arr}
+
+    cache_set("ryr_month", cache_payload, result)
     return result
+
 
 
 def hhmm(ts: Optional[str]) -> str:
@@ -109,14 +186,19 @@ def fetch_temp_last_year(lat: float, lon: float, d: date) -> Optional[float]:
     except ValueError:
         ly = d.replace(year=d.year - 1, day=28)
 
+    cache_payload = {"lat": lat, "lon": lon, "date": ly.isoformat(), "metric": "tmax"}
+    cached = cache_get("om_day", cache_payload)
+    if isinstance(cached, dict) and "t" in cached:
+        return None if cached["t"] is None else float(cached["t"])
+
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat,
         "longitude": lon,
         "start_date": ly.isoformat(),
         "end_date": ly.isoformat(),
-        "daily": ["temperature_2m_max"],  # <-- als LISTE!
-        "timezone": "UTC",                # <-- WICHTIG
+        "daily": "temperature_2m_max",
+        "timezone": "UTC",
     }
 
     try:
@@ -124,22 +206,23 @@ def fetch_temp_last_year(lat: float, lon: float, d: date) -> Optional[float]:
         r.raise_for_status()
         j = r.json()
 
-
         daily = j.get("daily")
         if not daily:
+            cache_set("om_day", cache_payload, {"t": None})
             return None
 
         temps = daily.get("temperature_2m_max")
         if not temps:
+            cache_set("om_day", cache_payload, {"t": None})
             return None
 
         t = temps[0]
-        if isinstance(t, (int, float)):
-            return float(t)
-
-        return None
+        out = float(t) if isinstance(t, (int, float)) else None
+        cache_set("om_day", cache_payload, {"t": out})
+        return out
     except Exception:
         return None
+
 
 
 # ---------- Model ----------
@@ -169,6 +252,8 @@ class Candidate:
 
     out_temp_ly: Optional[float] = None
     ret_temp_ly: Optional[float] = None
+    score: Optional[float] = None
+
 
 
 # ---------- Roundtrip-Suche ----------
@@ -268,7 +353,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QHBoxLayout, QVBoxLayout,
     QLabel, QComboBox, QLineEdit, QSpinBox, QPushButton,
     QGroupBox, QTableWidget, QTableWidgetItem, QSplitter, QMessageBox,
-    QTabWidget, QScrollArea, QDateEdit, QFileDialog, QSlider
+    QTabWidget, QScrollArea, QDateEdit, QFileDialog, QSlider, QCheckBox
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -277,7 +362,25 @@ import matplotlib.dates as mdates
 
 
 def fmt_temp(t: Optional[float]) -> str:
-    return "-" if t is None else f"{t:.1f}°C"
+    return "keine Temperaturdaten" if t is None else f"{t:.1f}°C"
+
+def parse_hhmm_from_iso(ts: Optional[str]) -> Optional[Tuple[int, int]]:
+    # "2025-12-19T06:40:00.000" -> (6,40)
+    if not ts or "T" not in ts:
+        return None
+    try:
+        hhmm = ts.split("T")[1][:5]
+        h, m = hhmm.split(":")
+        return int(h), int(m)
+    except Exception:
+        return None
+
+def time_in_range(ts: Optional[str], min_h: int, max_h: int) -> bool:
+    hm = parse_hhmm_from_iso(ts)
+    if hm is None:
+        return False
+    h, _ = hm
+    return (min_h <= h <= max_h)
 
 
 class PriceChart(FigureCanvas):
@@ -322,46 +425,68 @@ class PriceChart(FigureCanvas):
         self.draw()
         return color_map
 
-
-class TempChart(FigureCanvas):
+class TempHeatmapChart(FigureCanvas):
     def __init__(self, parent=None):
-        fig = Figure(figsize=(7, 4), tight_layout=True)
+        fig = Figure(figsize=(7, 4), constrained_layout=True)
         self.ax = fig.add_subplot(111)
         super().__init__(fig)
         self.setParent(parent)
+        self._cbar = None  # <--- merken
 
-    def plot_routes(self, temp_series: Dict[str, List[Tuple[date, float]]], color_map: Optional[Dict[str, str]] = None):
+    def plot_heatmap(self, temp_heatmap: Dict[str, Dict[date, float]], color_map=None):
         self.ax.clear()
-        if color_map is None:
-            color_map = {}
 
-        for label, data in temp_series.items():
-            if not data:
-                continue
-            data_sorted = sorted(data, key=lambda t: t[0])
-            xs = [d for d, _ in data_sorted]
-            ys = [t for _, t in data_sorted]
+        # <--- alte Colorbar entfernen, wenn vorhanden
+        if self._cbar is not None:
+            try:
+                self._cbar.remove()
+            except Exception:
+                try:
+                    self._cbar.ax.remove()
+                except Exception:
+                    pass
+            self._cbar = None
 
-            self.ax.plot(xs, ys, linestyle="solid", label=label, color=color_map.get(label))
+        all_dates = sorted({d for mp in temp_heatmap.values() for d in mp.keys()})
+        labels = list(temp_heatmap.keys())
 
-        self.ax.set_title("Temperatur (letztes Jahr) am Ziel pro Abflugtag")
-        self.ax.set_xlabel("Abflugdatum")
-        self.ax.set_ylabel("Temp (°C, LY)")
-        self.ax.grid(True, which="both", alpha=0.3)
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-        self.ax.tick_params(axis="x", rotation=45)
+        if not all_dates or not labels:
+            self.ax.text(0.5, 0.5, "Keine Temperaturdaten verfügbar",
+                         transform=self.ax.transAxes, ha="center", va="center", alpha=0.6)
+            self.draw()
+            return
 
-        handles, labels = self.ax.get_legend_handles_labels()
-        if labels:
-            self.ax.legend()
-        else:
-            self.ax.text(0.5, 0.5, "Keine Daten für diesen Zeitraum",
-                        transform=self.ax.transAxes, ha="center", va="center", alpha=0.6)
+        import numpy as np
+        mat = np.full((len(labels), len(all_dates)), np.nan, dtype=float)
+        for i, lab in enumerate(labels):
+            mp = temp_heatmap.get(lab, {})
+            for j, d in enumerate(all_dates):
+                if d in mp:
+                    mat[i, j] = mp[d]
+
+        im = self.ax.imshow(mat, aspect="auto", interpolation="nearest", cmap="coolwarm")
+        im.set_clim(vmin=0, vmax=35)
+
+        self.ax.set_title("Temperatur-Heatmap (letztes Jahr) am Ziel – pro Abflugdatum")
+        self.ax.set_yticks(range(len(labels)))
+        self.ax.set_yticklabels(labels)
+
+        step = max(1, len(all_dates) // 10)
+        xt = list(range(0, len(all_dates), step))
+        self.ax.set_xticks(xt)
+        self.ax.set_xticklabels([all_dates[k].strftime("%Y-%m-%d") for k in xt], rotation=45, ha="right")
+
+        # <--- Colorbar speichern
+        self._cbar = self.figure.colorbar(im, ax=self.ax)
+        self._cbar.set_label("°C")
 
         self.draw()
 
+
 class Worker(QObject):
-    finished = Signal(dict, list, dict, dict, str)
+    finished = Signal(dict, list, dict, dict, dict, str)
+    # per_route, combined, price_series, temp_series_line, temp_heatmap, error
+
 
     def __init__(self, params):
         super().__init__()
@@ -375,12 +500,30 @@ class Worker(QObject):
         routes = p["routes"]
         top_n = p["top_n"]
 
+        # Temp-Filter (optional)
+        use_weather_filter = p.get("use_weather_filter", False)
+        require_weather = p.get("require_weather", False)
+        ideal_temp = float(p.get("ideal_temp", 23.0))
+        temp_tol   = float(p.get("temp_tol", 5.0))
+
+        # Zeitfilter (Outbound)
+        use_time = p.get("use_time", False)
+        out_dep_min_h = p.get("out_dep_min_h", 0)
+        out_dep_max_h = p.get("out_dep_max_h", 23)
+        ret_dep_min_h = p.get("ret_dep_min_h", 0)
+        ret_dep_max_h = p.get("ret_dep_max_h", 23)
+
+
         month_cache: Dict[Tuple[str, str, int, int, str], Dict[str, DayQuote]] = {}
         per_route: Dict[str, List[Candidate]] = {}
         all_cands: List[Candidate] = []
 
         price_series: Dict[str, List[Tuple[date, float]]] = {}
-        temp_series: Dict[str, List[Tuple[date, float]]] = {}
+        temp_series: Dict[str, List[Tuple[date, float]]] = {}  # Linie (wie vorher)
+
+        # Heatmap: label -> dict(date -> temp)
+        temp_heatmap: Dict[str, Dict[date, float]] = {}
+
 
         weather_cache: Dict[Tuple[float, float, str], Optional[float]] = {}
 
@@ -406,6 +549,10 @@ class Worker(QObject):
 
         error = ""
         combined: List[Candidate] = []
+        if len(routes) >= 2 and all_cands:
+            all_cands.sort(key=lambda x: (x.score if x.score is not None else 1e18, x.total, x.out_day))
+            combined = all_cands[:top_n]
+
 
         try:
             start_date: date = p["start_date"]
@@ -417,35 +564,86 @@ class Worker(QObject):
                     o, d, start_date, end_date, min_days, max_days, currency, month_cache
                 )
 
-                rows = cands[:top_n]
-                for c in rows:
-                    # "da wo man fliegt" -> Ziel (dest)
+                # Wetter & Score + Filter
+                filtered: List[Candidate] = []
+                for c in cands:
+                    # Zeitfilter: Abflugstunden müssen in Range liegen
+                    use_time = p.get("use_time", False)
+
+                    # Zeitfilter nur wenn aktiv
+                    if use_time:
+                        if not time_in_range(c.dep_o, out_dep_min_h, out_dep_max_h):
+                            continue
+                        if not time_in_range(c.dep_r, ret_dep_min_h, ret_dep_max_h):
+                            continue
+
+                    # Temperaturen IMMER versuchen zu holen
                     c.out_temp_ly = get_temp_ly_for_iata(c.dest_iata, c.out_day)
                     c.ret_temp_ly = get_temp_ly_for_iata(c.dest_iata, c.ret_day)
+
+                    # Wetterfilter nur wenn aktiv
+                    if use_weather_filter:
+                        temps = [t for t in (c.out_temp_ly, c.ret_temp_ly) if t is not None]
+
+                        # wenn Filter an und "require": ohne Temps raus
+                        if require_weather and not temps:
+                            continue
+
+                        # wenn Temps da sind: prüfen
+                        if temps:
+                            avg_t = sum(temps) / len(temps)
+                            if not (ideal_temp - temp_tol <= avg_t <= ideal_temp + temp_tol):
+                                continue
+
+                    c.score = c.total
+                    filtered.append(c)
+
+                filtered.sort(key=lambda x: (x.score if x.score is not None else 1e18, x.total, x.out_day))
+
+                rows = filtered[:top_n]
                 per_route[label] = rows
 
-                all_cands.extend(cands)
 
-                best_per_day: Dict[str, float] = {}
-                for c in cands:
-                    best_per_day[c.out_day] = min(best_per_day.get(c.out_day, float("inf")), c.total)
+                best_price_per_day: Dict[str, float] = {}
+                best_temp_per_day: Dict[date, float] = {}
+
+                # Für Diagramme: pro Out-Day den besten Preis (aus gefilterten Kandidaten)
+                for c in filtered:
+                    best_price_per_day[c.out_day] = min(best_price_per_day.get(c.out_day, float("inf")), c.total)
+
+                    # Heatmap-Temp: nutze out_temp_ly am Ziel
+                    if c.out_temp_ly is not None:
+                        try:
+                            od = datetime.strptime(c.out_day, "%Y-%m-%d").date()
+                            # wenn mehrfach: nimm z.B. max oder mean; wir nehmen "max" hier
+                            best_temp_per_day[od] = max(best_temp_per_day.get(od, -1e9), c.out_temp_ly)
+                        except ValueError:
+                            pass
 
                 p_points: List[Tuple[date, float]] = []
                 t_points: List[Tuple[date, float]] = []
 
-                for day_str, best_total in best_per_day.items():
+                for day_str, best_total in best_price_per_day.items():
                     try:
                         dt_day = datetime.strptime(day_str, "%Y-%m-%d").date()
                     except ValueError:
                         continue
                     p_points.append((dt_day, best_total))
 
-                    t = get_temp_ly_for_iata(d, day_str)
-                    if t is not None:
-                        t_points.append((dt_day, t))
+                # Linie: aus best_temp_per_day
+                for dday, t in best_temp_per_day.items():
+                    t_points.append((dday, t))
 
-                price_series[label] = p_points
-                temp_series[label] = t_points
+                price_series[label] = sorted(p_points, key=lambda x: x[0])
+                temp_series[label] = sorted(t_points, key=lambda x: x[0])
+                temp_heatmap[label] = best_temp_per_day
+
+            combined_pool: List[Candidate] = []
+            for rows in per_route.values():
+                combined_pool.extend(rows)
+
+            combined_pool.sort(key=lambda x: (x.total, x.out_day))
+            combined = combined_pool[:top_n]
 
             if len(routes) >= 2 and all_cands:
                 all_cands.sort(key=lambda x: (x.total, x.out_day))
@@ -457,17 +655,12 @@ class Worker(QObject):
         except Exception as e:
             error = str(e)
 
-        # Wenn im Plot nirgendwo Temperaturen ankamen, sag es klar (aber ohne crash)
-        # 1) Wenn es gar keine Preis-Punkte gibt -> keine Flüge gefunden
-        if all((not pts) for pts in price_series.values()):
+        no_prices = all((not pts) for pts in price_series.values())
+        # Preise fehlen => nur dann wirklich "fatal"
+        if no_prices:
             error = "Keine Flüge/Preise in diesem Zeitraum gefunden (Ryanair API hat keine Daten geliefert)."
-        # 2) Flüge existieren, aber Temp-Serie leer -> Wetterproblem
-        elif all((not pts) for pts in temp_series.values()):
-            error = "Flüge gefunden, aber keine Temperaturdaten (Open-Meteo). Prüfe Internet/Firewall oder versuche kürzeren Zeitraum."
 
-
-
-        self.finished.emit(per_route, combined, price_series, temp_series, error)
+        self.finished.emit(per_route, combined, price_series, temp_series, temp_heatmap, error)
 
 
 class MainWindow(QMainWindow):
@@ -477,6 +670,8 @@ class MainWindow(QMainWindow):
         self.last_combined = []
         self.last_price_series = {}
         self.last_temp_series = {}
+        self.last_temp_heatmap = {}
+        self.view_temp_heatmap = {}
         self.view_per_route = {}
         self.view_combined = []
         self.view_price_series = {}
@@ -536,7 +731,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(price_wrap, "Preise")
 
         # Tab 3: Wetter
-        self.tempChart = TempChart()
+        self.tempChart = TempHeatmapChart()
         temp_wrap = QWidget()
         temp_lay = QVBoxLayout(temp_wrap)
         temp_lay.setContentsMargins(8, 8, 8, 8)
@@ -559,15 +754,73 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.o2, 1, 1); grid.addWidget(QLabel("→"), 1, 2); grid.addWidget(self.d2, 1, 3)
         left.addWidget(g_routes)
 
-        g_time = QGroupBox("Zeitraum & Optionen")
+        # =========================
+        # A) Datum
+        # =========================
+        g_date = QGroupBox("Nach Datum filtern")
+        gd = QGridLayout(g_date)
+
+        gd.addWidget(QLabel("Start-Tag"), 0, 0); gd.addWidget(self.dStart, 0, 1)
+        gd.addWidget(QLabel("End-Tag"),   0, 2); gd.addWidget(self.dEnd,   0, 3)
+        gd.addWidget(QLabel("Min. Tage"), 1, 0); gd.addWidget(self.minDays, 1, 1)
+        gd.addWidget(QLabel("Max. Tage"), 1, 2); gd.addWidget(self.maxDays, 1, 3)
+
+        left.addWidget(g_date)
+
+
+        # =========================
+        # B) Uhrzeit
+        # =========================
+        g_time = QGroupBox("Nach Uhrzeit filtern")
         gt = QGridLayout(g_time)
-        gt.addWidget(QLabel("Start-Tag"), 0, 0); gt.addWidget(self.dStart, 0, 1)
-        gt.addWidget(QLabel("End-Tag"), 0, 2);   gt.addWidget(self.dEnd, 0, 3)
-        gt.addWidget(QLabel("Min. Tage"), 1, 0); gt.addWidget(self.minDays, 1, 1)
-        gt.addWidget(QLabel("Max. Tage"), 1, 2); gt.addWidget(self.maxDays, 1, 3)
-        gt.addWidget(QLabel("Top-N"), 1, 4);     gt.addWidget(self.topN, 1, 5)
-        gt.addWidget(QLabel("Währung"), 2, 0);   gt.addWidget(self.currency, 2, 1)
+
+        self.cbUseTime = QCheckBox("Uhrzeit-Filter aktivieren")
+        self.cbUseTime.setChecked(False)
+
+        self.spOutDepMin = QSpinBox(); self.spOutDepMin.setRange(0, 23)
+        self.spOutDepMax = QSpinBox(); self.spOutDepMax.setRange(0, 23)
+        self.spRetDepMin = QSpinBox(); self.spRetDepMin.setRange(0, 23)
+        self.spRetDepMax = QSpinBox(); self.spRetDepMax.setRange(0, 23)
+
+        gt.addWidget(self.cbUseTime, 0, 0, 1, 4)
+        gt.addWidget(QLabel("Hinflug Abflug (min/max)"), 1, 0)
+        gt.addWidget(self.spOutDepMin, 1, 1); gt.addWidget(self.spOutDepMax, 1, 2)
+        gt.addWidget(QLabel("Rückflug Abflug (min/max)"), 2, 0)
+        gt.addWidget(self.spRetDepMin, 2, 1); gt.addWidget(self.spRetDepMax, 2, 2)
+
         left.addWidget(g_time)
+
+
+        # =========================
+        # C) Wetter
+        # =========================
+        g_weather = QGroupBox("Wetter (Temperaturen anzeigen / optional filtern)")
+        gw = QGridLayout(g_weather)
+
+        # 1) Wetter-Filter AUS per Default
+        self.cbUseWeatherFilter = QCheckBox("Nach Wetter filtern")
+        self.cbUseWeatherFilter.setChecked(False)
+
+        # Optional: wenn Filter an ist, aber keine Temperaturen => Ergebnis verwerfen
+        self.cbRequireWeather = QCheckBox("Beim Filtern: nur Ergebnisse mit Temperaturdaten")
+        self.cbRequireWeather.setChecked(False)
+
+        # 2) Ideal + Toleranz
+        self.spIdealTemp = QSpinBox(); self.spIdealTemp.setRange(-10, 40); self.spIdealTemp.setValue(23)
+        self.spTempTol   = QSpinBox(); self.spTempTol.setRange(0, 20); self.spTempTol.setValue(5)
+
+        gw.addWidget(self.cbUseWeatherFilter, 0, 0, 1, 4)
+        gw.addWidget(self.cbRequireWeather,   1, 0, 1, 4)
+
+        gw.addWidget(QLabel("Idealtemperatur (°C)"), 2, 0); gw.addWidget(self.spIdealTemp, 2, 1)
+        gw.addWidget(QLabel("± Toleranz (°C)"),      2, 2); gw.addWidget(self.spTempTol,   2, 3)
+
+        left.addWidget(g_weather)
+
+        # Toggle-Logik
+        self.cbUseWeatherFilter.stateChanged.connect(self.update_weather_ui_state)
+        self.cbRequireWeather.stateChanged.connect(self.update_weather_ui_state)
+        self.update_weather_ui_state()
 
         left.addWidget(self.btnSearch)
         left.addStretch(1)
@@ -607,6 +860,23 @@ class MainWindow(QMainWindow):
 
         left.addWidget(g_filter)
 
+        g_cache = QGroupBox("Cache")
+        gc = QGridLayout(g_cache)
+
+        self.btnClearRyr = QPushButton("Cache leeren (Flüge)")
+        self.btnClearWx  = QPushButton("Cache leeren (Wetter)")
+        self.btnClearAll = QPushButton("Cache leeren (Alles)")
+
+        self.btnClearRyr.clicked.connect(self.on_clear_cache_ryr)
+        self.btnClearWx.clicked.connect(self.on_clear_cache_weather)
+        self.btnClearAll.clicked.connect(self.on_clear_cache_all)
+
+        gc.addWidget(self.btnClearRyr, 0, 0)
+        gc.addWidget(self.btnClearWx,  1, 0)
+        gc.addWidget(self.btnClearAll, 2, 0)
+
+        left.addWidget(g_cache)
+
 
         splitter = QSplitter()
         left_widget = QWidget(); left_widget.setLayout(left)
@@ -619,6 +889,8 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(central)
         lay.addWidget(splitter)
         self.setCentralWidget(central)
+        self.statusBar().showMessage("Bereit.")
+
 
         self.mode.currentIndexChanged.connect(self.update_mode_fields)
         self.update_mode_fields()
@@ -636,6 +908,15 @@ class MainWindow(QMainWindow):
         else:
             self.o1.setEnabled(True); self.d1.setEnabled(True)
             self.o2.setEnabled(False); self.d2.setEnabled(False)
+
+    def update_weather_ui_state(self):
+        use_filter = self.cbUseWeatherFilter.isChecked()
+        self.cbRequireWeather.setEnabled(use_filter)
+        self.spIdealTemp.setEnabled(use_filter)
+        self.spTempTol.setEnabled(use_filter)
+
+        if not use_filter and self.cbRequireWeather.isChecked():
+            self.cbRequireWeather.setChecked(False)
 
     def clear_tables(self):
         while self.results_layout.count():
@@ -700,7 +981,12 @@ class MainWindow(QMainWindow):
             self.add_table("GESAMT-RANKING (gefiltert)", self.view_combined)
 
         self.last_color_map = self.priceChart.plot_routes(self.view_price_series, self.last_color_map)
-        self.tempChart.plot_routes(self.view_temp_series, self.last_color_map)
+        # Heatmap: filtere heatmap data auf Datum
+        filtered_heatmap = {}
+        for lab, mp in self.last_temp_heatmap.items():
+            filtered_heatmap[lab] = {d: t for d, t in mp.items() if fstart <= d <= fend}
+        self.tempChart.plot_heatmap(filtered_heatmap, self.last_color_map)
+
 
 
     def add_table(self, title: str, rows: List[Candidate]):
@@ -765,13 +1051,25 @@ class MainWindow(QMainWindow):
             routes=routes,
             start_date=start_date,
             end_date=end_date,
+
+            use_time=self.cbUseTime.isChecked(),
+            out_dep_min_h=int(self.spOutDepMin.value()),
+            out_dep_max_h=int(self.spOutDepMax.value()),
+            ret_dep_min_h=int(self.spRetDepMin.value()),
+            ret_dep_max_h=int(self.spRetDepMax.value()),
+
+            use_weather_filter=self.cbUseWeatherFilter.isChecked(),
+            require_weather=self.cbRequireWeather.isChecked(),
+            ideal_temp=float(self.spIdealTemp.value()),
+            temp_tol=float(self.spTempTol.value()),
         )
 
         self.btnSearch.setEnabled(False)
+        self.statusBar().showMessage("Suche läuft… bitte warten.")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.clear_tables()
         self.priceChart.plot_routes({})
-        self.tempChart.plot_routes({})
-
+        self.tempChart.plot_heatmap({})
 
         self.thread = QThread()
         self.worker = Worker(params)
@@ -783,9 +1081,13 @@ class MainWindow(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
-    def on_worker_finished(self, per_route: dict, combined: list, price_series: dict, temp_series: dict, error: str):
+    def on_worker_finished(self, per_route, combined, price_series, temp_series, temp_heatmap, error):
         self.btnSearch.setEnabled(True)
+        self.statusBar().showMessage("Fertig.")
+        QApplication.restoreOverrideCursor()
         if error:
+            self.statusBar().showMessage("Abgebrochen (Fehler).")
+            QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Fehler", error or "Unbekannter Fehler")
             return
 
@@ -795,13 +1097,14 @@ class MainWindow(QMainWindow):
             self.add_table("GESAMT-RANKING", combined)
 
         self.priceChart.plot_routes(price_series)
-        self.tempChart.plot_routes(temp_series)
+        self.tempChart.plot_heatmap(temp_heatmap)
 
         # speichern für Filter/Export
         self.last_per_route = per_route
         self.last_combined = combined
         self.last_price_series = price_series
         self.last_temp_series = temp_series
+        self.last_temp_heatmap = temp_heatmap
 
         self.btnExportCSV.setEnabled(True)
         self.btnExportPNG.setEnabled(True)
@@ -868,6 +1171,18 @@ class MainWindow(QMainWindow):
         self.tempChart.figure.savefig(p2, dpi=150)
 
         QMessageBox.information(self, "Export", f"PNG gespeichert:\n{p1}\n{p2}")
+
+    def on_clear_cache_ryr(self):
+        n = clear_cache("ryanair")
+        QMessageBox.information(self, "Cache", f"Flug-Cache geleert: {n} Datei(en).")
+
+    def on_clear_cache_weather(self):
+        n = clear_cache("weather")
+        QMessageBox.information(self, "Cache", f"Wetter-Cache geleert: {n} Datei(en).")
+
+    def on_clear_cache_all(self):
+        n = clear_cache("all")
+        QMessageBox.information(self, "Cache", f"Alle Caches geleert: {n} Datei(en).")
 
 
 
