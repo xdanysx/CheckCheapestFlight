@@ -9,14 +9,33 @@ from pathlib import Path
 import json
 import hashlib
 import time
-
-
-
+import csv
 
 # ---------- API Config via api.txt ----------
 
-BASE_DIR = Path(__file__).resolve().parent
-API_TXT_PATH = BASE_DIR / "../data/api.txt"
+# ---------- Paths (PyInstaller-sicher) ----------
+
+def app_root() -> Path:
+    """
+    Liefert einen stabilen Basis-Pfad:
+    - im Dev: Projekt-Root (…/CheckCheapestFlight)
+    - in PyInstaller: Ordner, wo die EXE liegt
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+def resource_path(relative: str) -> Path:
+    """
+    Ressourcen, die mit --add-data gebundled werden (liegen in _MEIPASS).
+    Im Dev-Fall liegen sie im Projekt.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative
+    return app_root() / relative
+
+BASE_DIR = app_root()
+API_TXT_PATH = resource_path("data/api.txt")
 
 _API_CACHE: Optional[dict] = None
 
@@ -51,7 +70,7 @@ def load_api_config() -> dict:
 
 # ---------- Cache ----------
 
-CACHE_ROOT = (BASE_DIR / "../cache").resolve()
+CACHE_ROOT = (BASE_DIR / "cache").resolve()
 RYR_CACHE_DIR = CACHE_ROOT / "ryanair"
 OM_CACHE_DIR  = CACHE_ROOT / "openmeteo"
 
@@ -275,6 +294,123 @@ class Candidate:
     ret_temp_ly: Optional[float] = None
     score: Optional[float] = None
 
+def candidate_to_dict(c: Candidate) -> dict:
+    return {
+        "total": c.total,
+        "base_total": c.base_total,
+        "out_day": c.out_day,
+        "ret_day": c.ret_day,
+        "out_price": c.out_price,
+        "ret_price": c.ret_price,
+        "dep_o": c.dep_o,
+        "arr_o": c.arr_o,
+        "dep_r": c.dep_r,
+        "arr_r": c.arr_r,
+        "route_label": c.route_label,
+        "origin_iata": c.origin_iata,
+        "dest_iata": c.dest_iata,
+        "pax_adults": c.pax_adults,
+        "pax_teens": c.pax_teens,
+        "pax_children": c.pax_children,
+        "pax_infants": c.pax_infants,
+        "bundle": c.bundle,
+        "bundle_extra_per_leg": c.bundle_extra_per_leg,
+        "infant_fee_per_leg": c.infant_fee_per_leg,
+        "out_temp_ly": c.out_temp_ly,
+        "ret_temp_ly": c.ret_temp_ly,
+        "score": c.score,
+    }
+
+def dict_to_candidate(d: dict) -> Candidate:
+    return Candidate(
+        total=float(d.get("total", 0.0)),
+        base_total=float(d.get("base_total", 0.0)),
+        out_day=str(d.get("out_day", "")),
+        ret_day=str(d.get("ret_day", "")),
+        out_price=float(d.get("out_price", 0.0)),
+        ret_price=float(d.get("ret_price", 0.0)),
+        dep_o=d.get("dep_o"),
+        arr_o=d.get("arr_o"),
+        dep_r=d.get("dep_r"),
+        arr_r=d.get("arr_r"),
+        route_label=str(d.get("route_label", "")),
+        origin_iata=str(d.get("origin_iata", "")),
+        dest_iata=str(d.get("dest_iata", "")),
+        pax_adults=int(d.get("pax_adults", 1)),
+        pax_teens=int(d.get("pax_teens", 0)),
+        pax_children=int(d.get("pax_children", 0)),
+        pax_infants=int(d.get("pax_infants", 0)),
+        bundle=str(d.get("bundle", "Basic")),
+        bundle_extra_per_leg=float(d.get("bundle_extra_per_leg", 0.0)),
+        infant_fee_per_leg=float(d.get("infant_fee_per_leg", 0.0)),
+        out_temp_ly=d.get("out_temp_ly"),
+        ret_temp_ly=d.get("ret_temp_ly"),
+        score=d.get("score"),
+    )
+
+def candidate_uid(c: Candidate) -> str:
+    # Stabiler Key: gleiche Route+Tage+Zeiten+PAX+Bundle => gilt als “gleich”
+    payload = {
+        "o": c.origin_iata, "d": c.dest_iata,
+        "od": c.out_day, "rd": c.ret_day,
+        "do": c.dep_o, "dr": c.dep_r,
+        "pax": [c.pax_adults, c.pax_teens, c.pax_children, c.pax_infants],
+        "bundle": c.bundle,
+        "bundle_extra": c.bundle_extra_per_leg,
+        "inf_fee": c.infant_fee_per_leg,
+        "total": round(float(c.total), 2),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+class SavedFlightsStore:
+    def __init__(self):
+        base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        self.dir = Path(base).resolve()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / "saved_flights.json"
+
+    def load(self) -> List[Candidate]:
+        if not self.path.exists():
+            return []
+        try:
+            obj = json.loads(self.path.read_text(encoding="utf-8"))
+            items = obj.get("items", [])
+            out: List[Candidate] = []
+            for it in items:
+                out.append(dict_to_candidate(it["candidate"]))
+            return out
+        except Exception:
+            return []
+
+    def save_all(self, items: List[Candidate]) -> None:
+        try:
+            data = {
+                "items": [{"uid": candidate_uid(c), "candidate": candidate_to_dict(c)} for c in items]
+            }
+            self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def upsert(self, items: List[Candidate], c: Candidate) -> List[Candidate]:
+        uid = candidate_uid(c)
+        mp = {candidate_uid(x): x for x in items}
+        mp[uid] = c
+        new_items = list(mp.values())
+        # Sort: günstigste zuerst
+        new_items.sort(key=lambda x: (x.total, x.out_day))
+        self.save_all(new_items)
+        return new_items
+
+    def remove(self, items: List[Candidate], c: Candidate) -> List[Candidate]:
+        uid = candidate_uid(c)
+        new_items = [x for x in items if candidate_uid(x) != uid]
+        self.save_all(new_items)
+        return new_items
+
+    def clear(self) -> None:
+        self.save_all([])
 
 
 
@@ -407,7 +543,7 @@ def find_roundtrips_for_route_by_dates(
 
 # ---------- GUI ----------
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QDate
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QDate, QStandardPaths
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QHBoxLayout, QVBoxLayout,
     QLabel, QComboBox, QLineEdit, QSpinBox, QPushButton,
@@ -816,11 +952,19 @@ class MainWindow(QMainWindow):
         self.lblSummaryBody.setTextFormat(Qt.RichText)
         self.lblSummaryBody.setWordWrap(True)
 
+        self.btnSaveCurrent = QPushButton("Diesen Flug speichern")
+        self.btnSaveCurrent.setEnabled(False)
+        self.btnSaveCurrent.clicked.connect(self.save_current_flight)
+
+        self.summaryLay.addWidget(self.btnSaveCurrent)
         self.summaryLay.addWidget(self.lblSummaryTitle)
         self.summaryLay.addWidget(self.lblSummaryBody)
         self.summaryLay.addStretch(1)
 
         self.tabs.addTab(self.summaryWrap, "Übersicht")
+
+        self.current_candidate: Optional[Candidate] = None
+
 
         # Tab 2: Preise
         self.priceChart = PriceChart()
@@ -838,6 +982,47 @@ class MainWindow(QMainWindow):
         temp_lay.addWidget(self.tempChart)
         self.tabs.addTab(temp_wrap, "Wetter")
 
+        # Tab 4: Gespeichert
+        self.saved_store = SavedFlightsStore()
+        self.saved_items: List[Candidate] = self.saved_store.load()
+
+        self.savedWrap = QWidget()
+        self.savedLay = QVBoxLayout(self.savedWrap)
+        self.savedLay.setContentsMargins(8, 8, 8, 8)
+
+        self.lblSavedHint = QLabel("Gespeicherte Flüge (Favoriten)")
+        self.lblSavedHint.setStyleSheet("font-weight:700; font-size:16px;")
+
+        self.savedTable = QTableWidget()
+        self.savedTable.setColumnCount(8)
+        self.savedTable.setHorizontalHeaderLabels([
+            "Total", "Out-Date", "Ret-Date",
+            "Out € / Zeit", "Ret € / Zeit",
+            "Out Temp LY", "Ret Temp LY",
+            "Route"
+        ])
+        self.savedTable.verticalHeader().setVisible(False)
+        self.savedTable.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.savedTable.setSelectionBehavior(QTableWidget.SelectRows)
+        self.savedTable.cellClicked.connect(lambda r, c, t=self.savedTable: self.on_saved_row_selected(t, r))
+
+        btnRow = QHBoxLayout()
+        self.btnRemoveSaved = QPushButton("Aus Favoriten entfernen")
+        self.btnClearSaved = QPushButton("Alle löschen")
+        self.btnRemoveSaved.clicked.connect(self.remove_selected_saved)
+        self.btnClearSaved.clicked.connect(self.clear_all_saved)
+        btnRow.addWidget(self.btnRemoveSaved)
+        btnRow.addWidget(self.btnClearSaved)
+        btnRow.addStretch(1)
+
+        self.savedLay.addWidget(self.lblSavedHint)
+        self.savedLay.addLayout(btnRow)
+        self.savedLay.addWidget(self.savedTable)
+
+        self.tabs.addTab(self.savedWrap, "Gespeichert")
+
+        self.render_saved_table()
+        self.btnRemoveSaved.setEnabled(False)
 
         left = QVBoxLayout()
 
@@ -1119,9 +1304,6 @@ class MainWindow(QMainWindow):
             self.spBundleExtra.setValue(0)
             self.spInfFee.setValue(0)
 
-
-
-
     def clear_tables(self):
         while self.results_layout.count():
             item = self.results_layout.takeAt(0)
@@ -1229,8 +1411,6 @@ class MainWindow(QMainWindow):
             filtered_heatmap[lab] = {d: t for d, t in mp.items() if fstart <= d <= fend}
         self.tempChart.plot_heatmap(filtered_heatmap, self.last_color_map)
 
-
-
     def add_table(self, title: str, rows: List[Candidate], stats: Optional[dict] = None):
         label = QLabel(title)
         label.setStyleSheet("font-weight:600; margin-top:8px;")
@@ -1266,7 +1446,6 @@ class MainWindow(QMainWindow):
         self.results_layout.addWidget(table)
 
         # --- Statistik-Label unter der Tabelle ---
-                # --- Statistik-Label unter der Tabelle ---
         if stats and stats.get("count_all", 0) > 0 and stats.get("avg_all") is not None:
             avg_all = float(stats["avg_all"])
             n_all = int(stats["count_all"])
@@ -1280,7 +1459,7 @@ class MainWindow(QMainWindow):
                 txt = f"Ø aller gefundenen Angebote: {avg_all:.2f} € (n={n_all})"
 
             lbl = QLabel(txt)
-            lbl.setStyleSheet("color:#999; margin-bottom:10px;")
+            lbl.setStyleSheet("color:#CCC; margin-bottom:10px;")
             self.results_layout.addWidget(lbl)
 
 
@@ -1292,6 +1471,17 @@ class MainWindow(QMainWindow):
         c: Candidate = rows[row_idx]
         self.show_summary(c)
         self.tabs.setCurrentWidget(self.summaryWrap)
+        self.current_candidate = c
+        self.btnSaveCurrent.setEnabled(True)
+
+    def save_current_flight(self):
+        c = getattr(self, "current_candidate", None)
+        if c is None:
+            return
+        self.saved_items = self.saved_store.upsert(self.saved_items, c)
+        self.render_saved_table()
+        self.statusBar().showMessage("Flug gespeichert.")
+        self.tabs.setCurrentWidget(self.savedWrap)
 
     def show_summary(self, c: Candidate):
         paying = max(0, c.pax_adults + c.pax_teens + c.pax_children)
@@ -1307,6 +1497,7 @@ class MainWindow(QMainWindow):
         infant_total = c.infant_fee_per_leg * legs * infants
 
         grand_total = base_total_all + bundle_total + infant_total
+        grand_total_per_person = grand_total / paying if paying > 0 else 0.0
 
         pax_lines = []
         pax_lines.append(f"Erwachsene: {c.pax_adults}")
@@ -1343,7 +1534,9 @@ class MainWindow(QMainWindow):
             4) Babygebühr: {c.infant_fee_per_leg:.2f} × {legs} × {infants} = <b>{infant_total:.2f} €</b><br>
             <hr style="border:none; border-top:1px solid #ddd; margin:10px 0;">
             <b>Gesamt:</b> {base_total_all:.2f} + {bundle_total:.2f} + {infant_total:.2f}
-            = <span style="font-size:18px; font-weight:700;">{grand_total:.2f} €</span>
+            = <span style="font-size:18px; font-weight:700;">{grand_total:.2f} €</span><br>
+            <b>Pro Person:</b> ({base_total_all:.2f} + {bundle_total:.2f} + {infant_total:.2f})/{paying}
+            = <span style="font-size:18px; font-weight:700;">{grand_total_per_person:.2f} €</span>
         </div>
 
         <div>
@@ -1356,6 +1549,47 @@ class MainWindow(QMainWindow):
 
         self.lblSummaryBody.setText(html)
 
+    def render_saved_table(self):
+        rows = self.saved_items
+        self.savedTable._rows = rows
+        self.savedTable.setRowCount(len(rows))
+
+        for r, c in enumerate(rows):
+            self.savedTable.setItem(r, 0, QTableWidgetItem(f"{c.total:.2f}"))
+            self.savedTable.setItem(r, 1, QTableWidgetItem(c.out_day))
+            self.savedTable.setItem(r, 2, QTableWidgetItem(c.ret_day))
+            self.savedTable.setItem(r, 3, QTableWidgetItem(f"{c.out_price:.2f} | {hhmm(c.dep_o)}→{hhmm(c.arr_o)}"))
+            self.savedTable.setItem(r, 4, QTableWidgetItem(f"{c.ret_price:.2f} | {hhmm(c.dep_r)}→{hhmm(c.arr_r)}"))
+            self.savedTable.setItem(r, 5, QTableWidgetItem(fmt_temp(c.out_temp_ly)))
+            self.savedTable.setItem(r, 6, QTableWidgetItem(fmt_temp(c.ret_temp_ly)))
+            self.savedTable.setItem(r, 7, QTableWidgetItem(c.route_label))
+
+        self.savedTable.resizeColumnsToContents()
+
+    def on_saved_row_selected(self, table: QTableWidget, row_idx: int):
+        rows = getattr(table, "_rows", None)
+        if not rows or row_idx < 0 or row_idx >= len(rows):
+            return
+        self.btnRemoveSaved.setEnabled(True)
+        c: Candidate = rows[row_idx]
+        self.show_summary(c)                # reused: zeigt Details
+        self.tabs.setCurrentWidget(self.summaryWrap)
+
+    def remove_selected_saved(self):
+        row = self.savedTable.currentRow()
+        rows = getattr(self.savedTable, "_rows", None)
+        if not rows or row < 0 or row >= len(rows):
+            return
+        c = rows[row]
+        self.saved_items = self.saved_store.remove(self.saved_items, c)
+        self.render_saved_table()
+        self.btnRemoveSaved.setEnabled(False)
+
+    def clear_all_saved(self):
+        self.saved_store.clear()
+        self.saved_items = []
+        self.render_saved_table()
+        self.btnRemoveSaved.setEnabled(False)
 
 
     def on_search(self):
@@ -1528,7 +1762,7 @@ class MainWindow(QMainWindow):
         if self.view_combined:
             rows = self.view_combined  # lieber das Ranking exportieren
 
-        import csv
+        
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["Gesamt", "Hinflug-Datum", "Rückflug-Datum", "Hinflug € / Zeit", "Rückflug € / Zeit", "Temp. Hin (letztes Jahr)", "Temp. Rück (letztes Jahr)", "Route"])

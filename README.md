@@ -16,4 +16,8 @@ und füge dort die Ryanair API-URL ein.
 Die Verantwortung für die Nutzung der API liegt bei dir.
 Bitte beachte die jeweiligen Bedingungen von Ryanair.
 
-anschließend "pyinstaller --noconfirm --clean --onefile --windowed --name RoundtripFinder --icon .\icon.ico .\src\main.py" eingeben.
+anschließend 
+
+pyinstaller --noconfirm --clean --windowed --name RoundtripFinder --icon .\icon.ico --version-file .\version_info.txt --add-data "data\api.txt;data" .\src\main.py 
+
+eingeben.
