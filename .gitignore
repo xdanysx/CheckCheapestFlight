@@ -3,6 +3,7 @@
 cache/
 build/
 dist/
+saves/*.json
 data/api.txt
 data/ryanair_api.txt
 RoundtripFinder.spec 

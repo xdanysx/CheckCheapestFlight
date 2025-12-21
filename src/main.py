@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import sys
 import requests
-import calendar
+import urllib.parse
+from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -10,8 +11,6 @@ import json
 import hashlib
 import time
 import csv
-
-# ---------- API Config via api.txt ----------
 
 # ---------- Paths (PyInstaller-sicher) ----------
 
@@ -36,6 +35,10 @@ def resource_path(relative: str) -> Path:
 
 BASE_DIR = app_root()
 API_TXT_PATH = resource_path("data/api.txt")
+# ---------- Saves ----------
+
+SAVES_ROOT = (BASE_DIR / "saves").resolve()
+SAVES_ROOT.mkdir(parents=True, exist_ok=True)
 
 _API_CACHE: Optional[dict] = None
 
@@ -154,6 +157,152 @@ BUNDLE_PRESETS = {
     "Plus":        {"extra": 50, "label": "Sitzplatz & Priority"},
     "Family Plus": {"extra": 42, "label": "für Familien"},
 }
+
+# ---------- POI / Map helpers (Nominatim + Overpass) ----------
+
+AIRPORTS = {
+    "PMO": {"name": "Palermo (PMO)", "lat": 38.1759, "lon": 13.0910},
+    "TPS": {"name": "Trapani (TPS)", "lat": 37.9114, "lon": 12.4880},
+    "CTA": {"name": "Catania (CTA)", "lat": 37.4668, "lon": 15.0664},
+}
+
+# ---------- POI Kategorien (DE) ----------
+
+_POI_CAT_DE = {
+    # amenity
+    "restaurant": "Restaurant",
+    "cafe": "Café",
+    "bar": "Bar",
+    "pub": "Pub",
+    "fast_food": "Fast Food",
+    "ice_cream": "Eisdiele",
+    "pharmacy": "Apotheke",
+    "hospital": "Krankenhaus",
+    "clinic": "Klinik",
+    "doctors": "Arzt",
+    "bank": "Bank",
+    "atm": "Geldautomat",
+    "parking": "Parkplatz",
+    "fuel": "Tankstelle",
+    "supermarket": "Supermarkt",
+    "marketplace": "Markt",
+    "toilets": "Toilette",
+    "police": "Polizei",
+
+    # tourism
+    "hotel": "Hotel",
+    "guest_house": "Pension",
+    "hostel": "Hostel",
+    "apartment": "Ferienwohnung",
+    "camp_site": "Campingplatz",
+    "museum": "Museum",
+    "attraction": "Sehenswürdigkeit",
+    "information": "Touristeninfo",
+    "viewpoint": "Aussichtspunkt",
+
+    # leisure
+    "beach_resort": "Strand",
+    "park": "Park",
+    "playground": "Spielplatz",
+    "sports_centre": "Sportzentrum",
+
+    # historic / natural (häufige)
+    "castle": "Burg/Schloss",
+    "ruins": "Ruine",
+    "monument": "Denkmal",
+    "peak": "Gipfel",
+    "beach": "Strand",
+    "cave_entrance": "Höhle",
+}
+
+def poi_category_raw(p: dict) -> str:
+    tags = p.get("tags", {}) or {}
+    return (
+        tags.get("tourism")
+        or tags.get("amenity")
+        or tags.get("natural")
+        or tags.get("historic")
+        or tags.get("leisure")
+        or "-"
+    )
+
+def poi_category_de(p: dict) -> str:
+    raw = poi_category_raw(p)
+    if raw == "-" or not raw:
+        return "-"
+    # fallback: hübscher machen (snake_case -> Wörter)
+    return _POI_CAT_DE.get(raw, raw.replace("_", " ").title())
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    R = 6371.0
+    p1, p2 = radians(lat1), radians(lat2)
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(p1)*cos(p2)*sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    return R * c
+
+def geocode_place_nominatim(query: str) -> Optional[Tuple[float, float, str]]:
+    """
+    Returns (lat, lon, display_name) or None
+    """
+    q = query.strip()
+    if not q:
+        return None
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": q, "format": "json", "limit": 1}
+    headers = {"User-Agent": "FlightChecker/1.0 (PySide6)"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+        r.raise_for_status()
+        arr = r.json()
+        if not arr:
+            return None
+        item = arr[0]
+        return float(item["lat"]), float(item["lon"]), str(item.get("display_name", q))
+    except Exception:
+        return None
+
+def overpass_pois(lat: float, lon: float, radius_m: int, limit: int = 120) -> List[dict]:
+    """
+    Very simple Overpass POI fetch:
+    returns list of dict: {name, lat, lon, tags}
+    """
+    # POI types: tourism/amenity/natural/historic/leisure
+    query = f"""
+    [out:json][timeout:25];
+    (
+      node(around:{radius_m},{lat},{lon})["tourism"];
+      node(around:{radius_m},{lat},{lon})["amenity"];
+      node(around:{radius_m},{lat},{lon})["natural"];
+      node(around:{radius_m},{lat},{lon})["historic"];
+      node(around:{radius_m},{lat},{lon})["leisure"];
+    );
+    out center {limit};
+    """
+    url = "https://overpass-api.de/api/interpreter"
+    headers = {"User-Agent": "FlightChecker/1.0 (PySide6)"}
+    try:
+        r = requests.post(url, data=query.encode("utf-8"), headers=headers, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        out = []
+        for el in j.get("elements", []):
+            tags = el.get("tags", {}) or {}
+            name = tags.get("name") or "(ohne Name)"
+            out.append({
+                "name": name,
+                "lat": float(el.get("lat")),
+                "lon": float(el.get("lon")),
+                "tags": tags,
+            })
+        # sort by distance + cut
+        for p in out:
+            p["dist_km"] = round(haversine_km(lat, lon, p["lat"], p["lon"]), 2)
+        out.sort(key=lambda x: x["dist_km"])
+        return out[:limit]
+    except Exception:
+        return []
 
 
 def fetch_cheapest_per_day_map(origin_iata: str, dest_iata: str, y: int, m: int, curr: str = CURRENCY_DEFAULT) -> Dict[str, dict]:
@@ -363,12 +512,9 @@ def candidate_uid(c: Candidate) -> str:
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
 
-
 class SavedFlightsStore:
     def __init__(self):
-        base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-        self.dir = Path(base).resolve()
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir = SAVES_ROOT
         self.path = self.dir / "saved_flights.json"
 
     def load(self) -> List[Candidate]:
@@ -412,6 +558,61 @@ class SavedFlightsStore:
     def clear(self) -> None:
         self.save_all([])
 
+class SavedPlacesStore:
+    def __init__(self):
+        self.dir = SAVES_ROOT
+        self.path = self.dir / "saved_places.json"
+
+    @staticmethod
+    def place_uid(p: dict) -> str:
+        payload = {
+            "name": p.get("name") or "",
+            "lat": round(float(p.get("lat", 0.0)), 6),
+            "lon": round(float(p.get("lon", 0.0)), 6),
+            "cat": poi_category_de(p),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:16]
+
+    def upsert(self, items: List[dict], p: dict, ctx_display_name: str = "") -> List[dict]:
+        it = dict(p)
+        it["cat_de"] = poi_category_de(p)
+        it["uid"] = self.place_uid(p)   # <-- HIER der entscheidende Fix
+        it["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        if ctx_display_name:
+            it["place_context"] = ctx_display_name
+
+        mp = {x.get("uid"): x for x in items if x.get("uid")}
+        mp[it["uid"]] = it
+
+        new_items = list(mp.values())
+        new_items.sort(key=lambda x: (x.get("cat_de", ""), float(x.get("dist_km", 9999)), x.get("name", "")))
+        self.save_all(new_items)
+        return new_items
+
+    def load(self) -> List[dict]:
+        if not self.path.exists():
+            return []
+        try:
+            obj = json.loads(self.path.read_text(encoding="utf-8"))
+            return obj.get("items", []) or []
+        except Exception:
+            return []
+
+    def save_all(self, items: List[dict]) -> None:
+        try:
+            data = {"items": items}
+            self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def remove(self, items: List[dict], uid: str) -> List[dict]:
+        new_items = [x for x in items if x.get("uid") != uid]
+        self.save_all(new_items)
+        return new_items
+
+    def clear(self) -> None:
+        self.save_all([])
 
 
 # ---------- Roundtrip-Suche ----------
@@ -543,14 +744,15 @@ def find_roundtrips_for_route_by_dates(
 
 # ---------- GUI ----------
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QDate, QStandardPaths
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QDate, QStandardPaths, QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QHBoxLayout, QVBoxLayout,
     QLabel, QComboBox, QLineEdit, QSpinBox, QPushButton,
     QGroupBox, QTableWidget, QTableWidgetItem, QSplitter, QMessageBox,
     QTabWidget, QScrollArea, QDateEdit, QFileDialog, QSlider, QCheckBox, QSizePolicy,
 )
-
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
@@ -877,9 +1079,6 @@ class Worker(QObject):
 
         self.finished.emit(per_route_top, per_route_all, per_route_stats, combined, price_series, temp_series, temp_heatmap, error)
 
-
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1006,6 +1205,8 @@ class MainWindow(QMainWindow):
         self.savedTable.setSelectionBehavior(QTableWidget.SelectRows)
         self.savedTable.cellClicked.connect(lambda r, c, t=self.savedTable: self.on_saved_row_selected(t, r))
 
+
+
         btnRow = QHBoxLayout()
         self.btnRemoveSaved = QPushButton("Aus Favoriten entfernen")
         self.btnClearSaved = QPushButton("Alle löschen")
@@ -1019,13 +1220,157 @@ class MainWindow(QMainWindow):
         self.savedLay.addLayout(btnRow)
         self.savedLay.addWidget(self.savedTable)
 
+        # --- Saved Places ---
+        self.places_store = SavedPlacesStore()
+        self.saved_places: List[dict] = self.places_store.load()
+
+        self.lblSavedPlacesHint = QLabel("Gespeicherte Orte (POIs)")
+        self.lblSavedPlacesHint.setStyleSheet("font-weight:700; font-size:16px; margin-top:14px;")
+
+        self.placesTable = QTableWidget()
+        self.placesTable.setColumnCount(5)
+        self.placesTable.setHorizontalHeaderLabels(["Name", "Kategorie", "Dist (km)", "Ort", "Gespeichert am"])
+        self.placesTable.verticalHeader().setVisible(False)
+        self.placesTable.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.placesTable.setSelectionBehavior(QTableWidget.SelectRows)
+        self.placesTable.cellClicked.connect(self.on_saved_place_selected)
+
+        btnRowP = QHBoxLayout()
+        self.btnRemovePlace = QPushButton("Ort entfernen")
+        self.btnClearPlaces = QPushButton("Alle Orte löschen")
+        self.btnRemovePlace.setEnabled(False)
+        self.btnRemovePlace.clicked.connect(self.remove_selected_place)
+        self.btnClearPlaces.clicked.connect(self.clear_all_places)
+        btnRowP.addWidget(self.btnRemovePlace)
+        btnRowP.addWidget(self.btnClearPlaces)
+        btnRowP.addStretch(1)
+
+        self.savedLay.addWidget(self.lblSavedPlacesHint)
+        self.savedLay.addLayout(btnRowP)
+        self.savedLay.addWidget(self.placesTable)
+
+        self.render_saved_places_table()
+
+
         self.tabs.addTab(self.savedWrap, "Gespeichert")
 
         self.render_saved_table()
         self.btnRemoveSaved.setEnabled(False)
 
-        left = QVBoxLayout()
+        # Tab X: Karte / Urlaubsstandort / POIs
+        self.mapWrap = QWidget()
+        self.mapLay = QVBoxLayout(self.mapWrap)
+        self.mapLay.setContentsMargins(8, 8, 8, 8)
+        self.mapLay.setSpacing(8)
 
+        row = QHBoxLayout()
+        self.edPlace = QLineEdit("Trappeto, Sicily, Italy")
+        self.edPlace.setPlaceholderText("Urlaubsstandort (Ort/Adresse)")
+
+        self.spRadius = QSpinBox()
+        self.spRadius.setRange(1, 50)
+        self.spRadius.setValue(15)
+        self.spRadius.setSuffix(" km")
+
+        self.spPoiLimit = QSpinBox()
+        self.spPoiLimit.setRange(10, 200)
+        self.spPoiLimit.setValue(80)
+        self.spPoiLimit.setSuffix(" POIs")
+
+        self.btnLoadMap = QPushButton("Karte & POIs laden")
+        self.btnLoadMap.clicked.connect(self.on_load_map)
+
+        row.addWidget(QLabel("Ort:"))
+        row.addWidget(self.edPlace, 1)
+        row.addWidget(QLabel("Radius:"))
+        row.addWidget(self.spRadius)
+        row.addWidget(self.spPoiLimit)
+        row.addWidget(self.btnLoadMap)
+
+        
+
+        self.lblPlaceInfo = QLabel("Noch keine Karte geladen.")
+        self.mapLay.addWidget(self.lblPlaceInfo)
+
+        self._map_ctx = None              # dict mit lat/lon/display_name/radius/pois
+        self._selected_poi = None         # aktueller POI dict
+
+
+        # Web view for folium HTML
+        self.webMap = QWebEngineView()
+        self.webMap.setMinimumHeight(300)
+        self.mapLay.addWidget(self.webMap, 2)
+        
+
+        # POI table
+        self.poiTable = QTableWidget()
+        self.poiTable.setColumnCount(3)
+        self.poiTable.setHorizontalHeaderLabels(["Name", "Dist (km)", "Kategorie"])
+        self.poiTable.verticalHeader().setVisible(False)
+        self.poiTable.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.poiTable.setSelectionBehavior(QTableWidget.SelectRows)
+        self.poiTable.setSortingEnabled(True)
+        self.poiTable.cellClicked.connect(self.on_poi_row_clicked)
+        self.poiTable.cellDoubleClicked.connect(self.on_poi_row_double_clicked)
+        self.mapLay.addWidget(self.poiTable, 1)
+
+        self._pois_all = []
+        self._pois_view = []
+
+
+        btnRow2 = QHBoxLayout()
+        self.btnGoogleSearch = QPushButton("Google-Suche")
+        self.btnGoogleSearch.setMinimumHeight(44)
+        self.btnGoogleSearch.setEnabled(False)
+        self.btnGoogleSearch.clicked.connect(self.on_open_google)
+
+        self.btnGoogleRoute = QPushButton("Google Maps Route")
+        self.btnGoogleRoute.setMinimumHeight(44)
+        self.btnGoogleRoute.setEnabled(False)
+        self.btnGoogleRoute.clicked.connect(self.on_open_google_maps_route)
+
+        self.btnSavePOI = QPushButton("POI speichern")
+        self.btnSavePOI.setMinimumHeight(44)
+        self.btnSavePOI.setEnabled(False)
+        self.btnSavePOI.clicked.connect(self.save_selected_poi)
+
+        btnRow2.addWidget(self.btnSavePOI, 1)
+
+        btnRow2.addWidget(self.btnGoogleSearch, 1)
+        btnRow2.addWidget(self.btnGoogleRoute, 1)
+
+        # --- Filter UI (über der Tabelle) ---
+        filterRow = QHBoxLayout()
+
+        self.edPoiFilter = QLineEdit()
+        self.edPoiFilter.setPlaceholderText("Filter: Name enthält… (z.B. beach, restaurant)")
+        self.edPoiFilter.textChanged.connect(self.apply_poi_filter)
+
+        self.cbPoiCat = QComboBox()
+        self.cbPoiCat.addItem("Alle Kategorien", userData=None)
+        # Kategorien füllen wir dynamisch nach dem Laden
+        self.cbPoiCat.currentIndexChanged.connect(self.apply_poi_filter)
+
+        self.spPoiMaxDist = QSpinBox()
+        self.spPoiMaxDist.setRange(1, 50)
+        self.spPoiMaxDist.setValue(50)
+        self.spPoiMaxDist.setSuffix(" km max")
+        self.spPoiMaxDist.valueChanged.connect(self.apply_poi_filter)
+
+        filterRow.addWidget(QLabel("Suche:"))
+        filterRow.addWidget(self.edPoiFilter, 1)
+        filterRow.addWidget(QLabel("Kategorie:"))
+        filterRow.addWidget(self.cbPoiCat)
+        filterRow.addWidget(self.spPoiMaxDist)
+
+        self.mapLay.addLayout(btnRow2)
+        self.mapLay.addLayout(row)
+        self.mapLay.addLayout(filterRow)
+
+        self.tabs.addTab(self.mapWrap, "Karte")
+
+
+        left = QVBoxLayout()
         g_mode = QGroupBox("Modus")
         lm = QVBoxLayout(g_mode)
         lm.addWidget(self.mode)
@@ -1793,6 +2138,305 @@ class MainWindow(QMainWindow):
         self.tempChart.figure.savefig(p2, dpi=150)
 
         QMessageBox.information(self, "Export", f"PNG gespeichert:\n{p1}\n{p2}")
+
+    def on_load_map(self):
+        place = self.edPlace.text().strip()
+        if not place:
+            QMessageBox.warning(self, "Eingabe", "Bitte einen Ort eingeben.")
+            return
+
+        self.statusBar().showMessage("Geocoding…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        geo = geocode_place_nominatim(place)
+        if not geo:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Fehler", "Ort konnte nicht gefunden werden (Geocoding fehlgeschlagen).")
+            self.statusBar().showMessage("Fehler.")
+            return
+
+        lat, lon, display_name = geo
+        radius_km = int(self.spRadius.value())
+        radius_m = min(50, radius_km) * 1000
+        limit = int(self.spPoiLimit.value())
+
+        self.statusBar().showMessage("POIs laden…")
+        pois = overpass_pois(lat, lon, radius_m=int(radius_m), limit=limit)
+
+        # Context speichern
+        self._map_ctx = {
+            "lat": lat,
+            "lon": lon,
+            "display_name": display_name,
+            "radius_m": int(radius_m),
+            "radius_km": int(radius_km),
+            "pois": pois,
+        }
+
+        self._pois_all = pois
+        self._pois_view = list(pois)  # Start: alles sichtbar
+
+        # Kategorien neu füllen
+        self.cbPoiCat.blockSignals(True)
+        self.cbPoiCat.clear()
+        self.cbPoiCat.addItem("Alle Kategorien", userData=None)
+
+        cats = sorted({self._poi_category_str(p) for p in self._pois_all if self._poi_category_str(p) != "-"})
+        for c in cats:
+            self.cbPoiCat.addItem(c, userData=c)
+
+        self.cbPoiCat.blockSignals(False)
+        self.spPoiMaxDist.setValue(min(50, int(self.spRadius.value())))
+        self.apply_poi_filter()
+
+        
+        self._selected_poi = None
+        # Ohne Auswahl: Route bleibt aus, Suche kann optional schon den Ort öffnen
+        self.btnGoogleSearch.setEnabled(True)
+        self.btnGoogleRoute.setEnabled(False)
+
+        # Map rendern
+        self._render_map(None)
+
+        self.lblPlaceInfo.setText(
+            f"<b>{display_name}</b><br>POIs gefunden: {len(pois)} | Radius: {radius_km} km"
+        )
+
+        QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage("Karte geladen.")
+        self.tabs.setCurrentWidget(self.mapWrap)
+
+    def _render_map(self, selected_poi: Optional[dict] = None, pois_override: Optional[List[dict]] = None) -> None:
+        if not self._map_ctx:
+            return
+
+        lat = self._map_ctx["lat"]
+        lon = self._map_ctx["lon"]
+        display_name = self._map_ctx["display_name"]
+        radius_m = self._map_ctx["radius_m"]
+        radius_km = self._map_ctx["radius_km"]
+
+        # ✅ neu: wenn kein Override, nimm die gefilterte Ansicht
+        pois = pois_override if pois_override is not None else (self._pois_view or self._map_ctx.get("pois", []))
+
+        try:
+            import folium
+
+            if selected_poi:
+                center = [selected_poi["lat"], selected_poi["lon"]]
+                zoom = 15
+            else:
+                center = [lat, lon]
+                zoom = 12
+
+            m = folium.Map(location=center, zoom_start=zoom, control_scale=True)
+
+            folium.Marker(
+                [lat, lon],
+                tooltip="Urlaubsstandort",
+                popup=display_name,
+                icon=folium.Icon(icon="home"),
+            ).add_to(m)
+
+            folium.Circle(
+                location=[lat, lon],
+                radius=radius_m,
+                color="blue",
+                fill=False,
+                weight=2,
+                opacity=0.7,
+                tooltip=f"Radius {radius_km} km",
+            ).add_to(m)
+
+            for code, a in AIRPORTS.items():
+                dist = haversine_km(lat, lon, a["lat"], a["lon"])
+                folium.Marker(
+                    [a["lat"], a["lon"]],
+                    tooltip=f"{code} – {a['name']}",
+                    popup=f"{code}: {a['name']} ({dist:.1f} km Luftlinie)",
+                    icon=folium.Icon(icon="plane", prefix="fa"),
+                ).add_to(m)
+
+            # ✅ POIs: jetzt nur die (gefilterten) `pois`
+            for p in pois[:120]:
+                cat_raw = poi_category_raw(p)
+                if selected_poi and p is selected_poi:
+                    continue
+
+                folium.CircleMarker(
+                    location=[p["lat"], p["lon"]],
+                    radius=4,
+                    tooltip=f"{p['name']} ({p.get('dist_km','?')} km)",
+                    popup=cat_raw,
+                    fill=True,
+                ).add_to(m)
+
+            if selected_poi:
+                cat = poi_category_de(selected_poi)
+                folium.Marker(
+                    [selected_poi["lat"], selected_poi["lon"]],
+                    tooltip=f"Ausgewählt: {selected_poi['name']}",
+                    popup=f"{selected_poi['name']} – {cat} ({selected_poi.get('dist_km','?')} km)",
+                    icon=folium.Icon(color="red", icon="star"),
+                ).add_to(m)
+
+            html = m.get_root().render()
+            self.webMap.setHtml(html)
+
+        except Exception as e:
+            self.webMap.setHtml(f"<h3>Karte konnte nicht gerendert werden</h3><pre>{e}</pre>")
+
+
+    def _render_poi_table(self) -> None:
+        pois = self._pois_view or []
+        self.poiTable.setSortingEnabled(False)  # wichtig während setItem, sonst zickt das Sorting
+        self.poiTable.setRowCount(len(pois))
+
+        for r, p in enumerate(pois):
+            cat = self._poi_category_str(p)
+            self.poiTable.setItem(r, 0, QTableWidgetItem(str(p.get("name", ""))))
+            self.poiTable.setItem(r, 1, QTableWidgetItem(f"{float(p.get('dist_km', 0.0)):.2f}"))
+            self.poiTable.setItem(r, 2, QTableWidgetItem(str(cat)))
+
+        self.poiTable.resizeColumnsToContents()
+        self.poiTable.setSortingEnabled(True)
+
+    def apply_poi_filter(self) -> None:
+        if not self._map_ctx:
+            return
+
+        q = (self.edPoiFilter.text() or "").strip().lower()
+        wanted_cat = self.cbPoiCat.currentData()
+        max_dist = float(self.spPoiMaxDist.value())
+
+        out = []
+        for p in self._pois_all:
+            name = (p.get("name") or "").lower()
+            if q and q not in name:
+                continue
+
+            if wanted_cat is not None:
+                if self._poi_category_str(p) != wanted_cat:
+                    continue
+
+            if float(p.get("dist_km", 9999)) > max_dist:
+                continue
+
+            out.append(p)
+
+        self._pois_view = out
+        self._render_poi_table()
+
+        # Auswahl zurücksetzen
+        self._selected_poi = None
+        self.btnGoogleSearch.setEnabled(True)
+        self.btnGoogleRoute.setEnabled(False)
+        self.btnSavePOI.setEnabled(False)
+
+        # Map zurück auf "kein selected"
+        self._render_map(None, pois_override=self._pois_view)
+
+        # Info label
+        display_name = self._map_ctx.get("display_name", "")
+        self.lblPlaceInfo.setText(
+            f"<b>{display_name}</b><br>POIs angezeigt: {len(self._pois_view)} / {len(self._pois_all)}"
+        )
+
+
+    def _poi_category_str(self, p: dict) -> str:
+        return poi_category_de(p)
+
+    def save_selected_poi(self) -> None:
+        if not self._map_ctx or not self._selected_poi:
+            return
+        display_name = self._map_ctx.get("display_name", "")
+        self.saved_places = self.places_store.upsert(self.saved_places, self._selected_poi, ctx_display_name=display_name)
+        self.render_saved_places_table()
+        self.statusBar().showMessage("POI gespeichert.")
+        self.tabs.setCurrentWidget(self.savedWrap)
+
+    def render_saved_places_table(self) -> None:
+        rows = self.saved_places
+        self.placesTable._rows = rows
+        self.placesTable.setRowCount(len(rows))
+        for r, p in enumerate(rows):
+            self.placesTable.setItem(r, 0, QTableWidgetItem(str(p.get("name", ""))))
+            self.placesTable.setItem(r, 1, QTableWidgetItem(str(p.get("cat_de", p.get("cat", "-")))))
+            self.placesTable.setItem(r, 2, QTableWidgetItem(f"{float(p.get('dist_km', 0.0)):.2f}"))
+            self.placesTable.setItem(r, 3, QTableWidgetItem(str(p.get("place_context", ""))))
+            self.placesTable.setItem(r, 4, QTableWidgetItem(str(p.get("saved_at", ""))))
+        self.placesTable.resizeColumnsToContents()
+        self.btnRemovePlace.setEnabled(False)
+
+    def on_saved_place_selected(self, row: int, col: int) -> None:
+        self.btnRemovePlace.setEnabled(True)
+
+    def remove_selected_place(self) -> None:
+        row = self.placesTable.currentRow()
+        rows = getattr(self.placesTable, "_rows", None)
+        if not rows or row < 0 or row >= len(rows):
+            return
+        uid = rows[row].get("uid")
+        if not uid:
+            return
+        self.saved_places = self.places_store.remove(self.saved_places, uid)
+        self.render_saved_places_table()
+
+    def clear_all_places(self) -> None:
+        self.places_store.clear()
+        self.saved_places = []
+        self.render_saved_places_table()
+
+
+    def on_poi_row_clicked(self, row: int, col: int) -> None:
+        if not self._map_ctx:
+            return
+        if row < 0 or row >= len(self._pois_view):
+            return
+
+        self._selected_poi = self._pois_view[row]
+        self._render_map(self._selected_poi)
+
+        self.btnGoogleSearch.setEnabled(True)
+        self.btnGoogleRoute.setEnabled(True)
+        self.btnSavePOI.setEnabled(True)
+        self.statusBar().showMessage(f"POI ausgewählt: {self._selected_poi.get('name','')}")
+
+    def on_poi_row_double_clicked(self, row: int, col: int) -> None:
+        # Doppelklick = sofort Route öffnen
+        self.on_poi_row_clicked(row, col)
+        self.on_open_google_maps_route()
+
+    def on_open_google_maps_route(self) -> None:
+        if not self._map_ctx or not self._selected_poi:
+            return
+
+        o_lat = self._map_ctx["lat"]
+        o_lon = self._map_ctx["lon"]
+        d_lat = self._selected_poi["lat"]
+        d_lon = self._selected_poi["lon"]
+
+        url = (
+            "https://www.google.com/maps/dir/?api=1"
+            f"&origin={o_lat},{o_lon}"
+            f"&destination={d_lat},{d_lon}"
+            "&travelmode=driving"
+        )
+        QDesktopServices.openUrl(QUrl(url))
+
+
+    def on_open_google(self) -> None:
+        if not self._map_ctx:
+            return
+
+        display_name = self._map_ctx.get("display_name", "")
+        q = display_name
+
+        if self._selected_poi:
+            q = f"{self._selected_poi.get('name','')} {display_name}"
+
+        url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(q)
+        QDesktopServices.openUrl(QUrl(url))
 
     def on_clear_cache_ryr(self):
         n = clear_cache("ryanair")
