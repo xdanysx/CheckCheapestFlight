@@ -161,6 +161,8 @@ BUNDLE_PRESETS = {
 # ---------- POI / Map helpers (Nominatim + Overpass) ----------
 
 AIRPORTS = {
+    "CGN": {"name": "Köln (CGN)", "lat": 50.86590, "lon": 7.14270},
+    "NRN": {"name": "Düsseldorf Weeze (NRN)", "lat": 51.6015, "lon": 6.1387},
     "PMO": {"name": "Palermo (PMO)", "lat": 38.1759, "lon": 13.0910},
     "TPS": {"name": "Trapani (TPS)", "lat": 37.9114, "lon": 12.4880},
     "CTA": {"name": "Catania (CTA)", "lat": 37.4668, "lon": 15.0664},
@@ -2357,7 +2359,6 @@ class MainWindow(QMainWindow):
 
     def render_saved_places_table(self) -> None:
         rows = self.saved_places
-        self.placesTable._rows = rows
         self.placesTable.setRowCount(len(rows))
         for r, p in enumerate(rows):
             self.placesTable.setItem(r, 0, QTableWidgetItem(str(p.get("name", ""))))
@@ -2373,10 +2374,9 @@ class MainWindow(QMainWindow):
 
     def remove_selected_place(self) -> None:
         row = self.placesTable.currentRow()
-        rows = getattr(self.placesTable, "_rows", None)
-        if not rows or row < 0 or row >= len(rows):
+        if row < 0 or row >= len(self.saved_places):
             return
-        uid = rows[row].get("uid")
+        uid = self.saved_places[row].get("uid")
         if not uid:
             return
         self.saved_places = self.places_store.remove(self.saved_places, uid)
